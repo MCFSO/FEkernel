@@ -57,6 +57,35 @@ static void rq_push(struct fe_thread *t)
 {
     u32 p = t->priority;
     FE_ASSERT(p < FE_THREAD_PRIO_LEVELS);
+    /* ★ 不变式：**一个线程被 push 时不能已经在就绪队列里** ★
+     *
+     * ★ 为什么这条断言值钱（它可能同时解释两种症状）★
+     * 双 push 会在就绪链上造出**环**（同一个节点被接两次，`rq_next`
+     * 互相指回去），而一个环能同时产生我们实测到的两种症状：
+     *   - `rq_pick` 顺着环走，可能挑到一个指针已经失效的节点 ⇒ 读
+     *     `next->task->iopb_slot` 就是 #PF（`CR2 = 任务地址 + 0x1060`）；
+     *   - 队列永远转不回 `main` ⇒ 一次 yield 切走之后再也不回来（挂死）。
+     * **两个症状、一个原因**——这比"逐个加固"更可能是真相，
+     * 所以这里不是防御性代码，它是一次**证据收集**。
+     *
+     * 判据用"指针是不是已经挂在链上"（`rq_next`/`rq_prev`/队头队尾），
+     * **不用"就绪位为 0"**：`g_ready_mask` 的位是**按优先级**的，同一级里
+     * 只要有**别的**线程就绪，那一位就是 1——拿它当"这个线程在不在队列里"
+     * 的判据会误报。
+     *
+     * ★ 违反时：点名 + **不 push** ★ 它已经在队列里了，再 push 一次正是
+     * 造环的那一步；点名是为了让调用者（凶手）现形。 */
+    if (t->rq_next != NULL || t->rq_prev != NULL ||
+        g_runq[p].head == t || g_runq[p].tail == t) {
+        fe_kprintf("[调度] **rq_push 收到一个已经在就绪队列里的线程**："
+                   "%s(id=%llu state=%u prio=%u) rq_prev=%p rq_next=%p "
+                   "队头=%p 队尾=%p 调用者=%#llx —— 已丢弃这次 push（否则造环）\n",
+                   t->name, (unsigned long long)t->id, t->state, p,
+                   (void *)t->rq_prev, (void *)t->rq_next,
+                   (void *)g_runq[p].head, (void *)g_runq[p].tail,
+                   (unsigned long long)(uptr)__builtin_return_address(0));
+        return;
+    }
     t->rq_next = NULL;
     t->rq_prev = g_runq[p].tail;
     if (g_runq[p].tail) {
@@ -88,6 +117,67 @@ static void rq_remove(struct fe_thread *t)
     }
 }
 
+/* ★ 就绪链体检：抓"环"与"不在册的节点"（第 5 步第三步）★
+ *
+ * ★ 为什么要有它 ★ `rq_pick` 只取队头、`rq_remove` 只动相邻指针——两者都
+ * **不遍历整条链**，所以一条被双 push 弄成环的链不会有任何症状，直到
+ * 有人顺着它走：`fe_thread_dump_all` 会转不出来，而"某个线程永远轮不到"
+ * 就是一次 yield 切走之后再也回不来（我们追了几轮的挂死）。
+ * 这条体检是**唯一**能主动看见"链本身坏了"的地方。
+ *
+ * ★ 两条约束（都不许违反）★
+ *   1. **检测器自己不许崩**：遇到"不在 `g_all` 在册链上"的指针时，**只打
+ *      指针值就停**，绝不解引用它——读一块已释放内存的 `name`/`state`
+ *      正是第 3 步那个 #PF 的形态（`CR2 = 任务地址 + 0x1060`）；
+ *   2. **有界**：最多走 `8 × 在册线程数 + 16` 步，超了就打"疑似成环"并把
+ *      走过的节点逐个打印，然后停。
+ *
+ * 只在发现异常时打印；为了不拖慢每次调度，每 64 次 pick 才体检一次。 */
+static void rq_audit(u32 prio)
+{
+    /* 在册线程数（同时也是"合法节点集合"） */
+    u32 registered = 0;
+    for (struct fe_thread *q = g_all; q; q = q->all_next) {
+        registered++;
+    }
+    u32 budget = registered * 8u + 16u;
+    u32 steps = 0;
+    for (struct fe_thread *q = g_runq[prio].head; q; q = q->rq_next) {
+        if (++steps > budget) {
+            fe_kprintf("[调度] **就绪链疑似成环**（prio=%u，走了 %u 步 > 上限 %u）"
+                       "，走过的节点：\n", prio, steps, budget);
+            u32 k = 0;
+            for (struct fe_thread *r = g_runq[prio].head; r && k < steps; r = r->rq_next) {
+                fe_kprintf("          第 %u 个=%p", k, (void *)r);
+                for (struct fe_thread *s = g_all; s; s = s->all_next) {
+                    if (s == r) {
+                        fe_kprintf("（在册：%s id=%llu state=%u）", r->name,
+                                   (unsigned long long)r->id, r->state);
+                        break;
+                    }
+                }
+                fe_kprintf("\n");
+                k++;
+            }
+            return;
+        }
+        /* ★ 在册性检查：**只比指针值**，不解引用 ★ */
+        bool known = false;
+        for (struct fe_thread *s = g_all; s; s = s->all_next) {
+            if (s == q) {
+                known = true;
+                break;
+            }
+        }
+        if (!known) {
+            fe_kprintf("[调度] **就绪链上有不在册的节点** %p（prio=%u，第 %u 个）"
+                       "——它可能已经被回收；不解引用，体检到此为止\n",
+                       (void *)q, prio, steps);
+            return;
+        }
+    }
+}
+
 /* 取出最高优先级的就绪线程（已从队列摘除） */
 static struct fe_thread *rq_pick(void)
 {
@@ -95,6 +185,12 @@ static struct fe_thread *rq_pick(void)
         return NULL;
     }
     u32 p = 31u - (u32)__builtin_clz(g_ready_mask);
+    /* 体检（每 64 次一次，只在异常时打印）：见 rq_audit 的说明。 */
+    static u32 audit_countdown;
+    if (++audit_countdown >= 64u) {
+        audit_countdown = 0;
+        rq_audit(p);
+    }
     struct fe_thread *t = g_runq[p].head;
     if (t) {
         rq_remove(t);
@@ -568,12 +664,58 @@ void fe_sched_block_current(void)
 
 void fe_sched_wake(struct fe_thread *t)
 {
-    if (!t || t->state != FE_THREAD_BLOCKED) {
+    if (!t) {
+        return;
+    }
+    /* ★ 点名，但**不许静默 return**（队列卫生，第 5 步）★
+     *
+     * 静默正是让这类 bug 活下来的原因：一个"叫醒了一个不该被叫醒的线程"
+     * 的调用会安安静静地什么都不做，于是症状延后到别处才显形
+     * （就绪链上多一个不该在的节点、`rq_pick` 挑到失效指针、或者
+     * 一次 yield 之后再也回不来）。
+     *
+     * ★ 判据不许直接解引用可疑指针 ★
+     * 传进来的 `t` 可能指向**已经 unmap 的页**——读 `t->state` 就是
+     * 一次 #PF（第 3 步实测过：`CR2 = 任务地址 + 0x1060`）。
+     * 所以先用**注册表**（`g_all` 线程链）判断它在不在册：
+     *   - 不在册 → 只打指针值与调用者（`__builtin_return_address(0)`，
+     *     与 fe_pmm_free_frames 用的是同一招），**一个字节都不碰它**；
+     *   - 在册   → 指针可信，可以安全打印 name/id/state。 */
+    bool known = false;
+    for (struct fe_thread *q = g_all; q; q = q->all_next) {
+        if (q == t) {
+            known = true;
+            break;
+        }
+    }
+    if (!known) {
+        fe_kprintf("[调度] **fe_sched_wake 收到一个不在册的线程指针** %p"
+                   "（调用者=%#llx）——它可能已经被回收；不解引用，直接丢弃\n",
+                   (void *)t,
+                   (unsigned long long)(uptr)__builtin_return_address(0));
         return;
     }
     u64 irq = fe_irq_save();
-    t->state = FE_THREAD_READY;
-    rq_push(t);
+    if (t->state == FE_THREAD_BLOCKED) {
+        t->state = FE_THREAD_READY;
+        rq_push(t);
+    } else if (t->state == FE_THREAD_SLEEPING) {
+        /* ★ 只点名、**不动它**（第 5 步第二步的收窄）★
+         * 叫醒 SLEEPING 是 **D3 的修复范围**，不属于"队列卫生"这一步：
+         * 把它做进来会偷偷修掉 D3，让"D 组仍如实变红"这条判据失去意义
+         * ——单一变量优先于"顺手修好"。 */
+        fe_kprintf("[调度] **fe_sched_wake 收到 SLEEPING 的线程**：%s(id=%llu)"
+                   "（本步不动它——叫醒睡眠是 D3 的修复范围；调用者=%#llx）\n",
+                   t->name, (unsigned long long)t->id,
+                   (unsigned long long)(uptr)__builtin_return_address(0));
+    } else {
+        fe_kprintf("[调度] **fe_sched_wake 收到状态不对的线程**：%s(id=%llu "
+                   "state=%u)（只接受 BLOCKED=%u；调用者=%#llx）"
+                   "——指针在册，所以这些字段是可信的\n",
+                   t->name, (unsigned long long)t->id, t->state,
+                   FE_THREAD_BLOCKED,
+                   (unsigned long long)(uptr)__builtin_return_address(0));
+    }
     fe_irq_restore(irq);
 }
 
@@ -736,6 +878,14 @@ static void thread_free(struct fe_thread *t)
     if (!t) {
         return;
     }
+    /* ★ 不变式：**任何被释放的线程都不在任何队列上** ★
+     * 与 thread_mark_dead 里那句 `rq_remove` 是同一条不变式的两个落点：
+     * 那句保证"死了就不在队列里"，这句保证"被释放了就不在队列里"。
+     * 两道都要——中间还隔着"回收"这一步（僵尸链 → `thread_free`），
+     * 而僵尸是**可能**被重新排进队列的（`fe_sched_wake` 收到失效指针、
+     * 或某条路径重复 push）。队列上留着一根指向已释放内存的指针，
+     * 下一次 `rq_pick` 就会把它当线程用。 */
+    rq_remove(t);
     if (t->stack_base) {
         fe_kfree(t->stack_base);
         t->stack_base = NULL;

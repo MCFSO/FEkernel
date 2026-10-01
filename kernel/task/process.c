@@ -561,7 +561,25 @@ u32 fe_task_cleanup_probes(struct fe_task *task, const char *tag)
     if (!task) {
         return 0;
     }
-    u32 marked = fe_task_kill_other_threads(task, NULL);
+    /* ★ 不变式：**"清场"这个动作的语义里永远不该包含调用者** ★
+     *
+     * `keep` 传 `NULL` 在 `fe_task_terminate` 那里是**对的**（整个任务完蛋，
+     * 连主线程一起走）；在这里是**错的**——我们只是清掉自检造出来的探针，
+     * 调用者（`main`）还要接着把自检跑完。
+     *
+     * 为什么这一条必须写成断言而不是"记得传对参数"：调用者一旦被标记，
+     * 它**下一次经过闸门**就会被就地判死、摘出就绪队列，而症状是
+     * "一次 yield 切走、永远回不来"——那与我们追了三个小时的挂死
+     * 一模一样。这个错误在这里犯过一次（原来传的是 `NULL`），
+     * 所以留一条断言把它钉住。 */
+    struct fe_thread *self = fe_thread_current();
+    u32 marked = fe_task_kill_other_threads(task, self);
+    if (self && self->kill_pending) {
+        fe_kprintf("        **收尾把自己标记了**：调用者 %s(id=%llu) 处于"
+                   " kill_pending —— 清场动作绝不该包含调用者，"
+                   "它会在下一次经过闸门时被判死\n",
+                   self->name, (unsigned long long)self->id);
+    }
     /* 给被标记的探针几次调度机会：它们要么走到闸门、要么走进取消点。
      * 用"睡 2 ms"而不是"让出"——让出只在当前线程自己的时间片里转，
      * 被唤醒的线程可能一次都选不上（实测过）。 */
