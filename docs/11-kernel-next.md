@@ -119,7 +119,7 @@
 
 ★ 这两条为什么不危险、但必须记 ★ 真实路径走的是**另一条**：
 `fe_read_cr2()`（`kernel/include/fe/io.h:86` 的 `FE_INLINE`）+ 现场的
-`r->error`，都在 `idt.c:313`（`u64 cr2 = (r->vector == 14u) ? fe_read_cr2() : 0;`）
+`r->error`，都在 `kernel/arch/x86_64/idt.c:313`（`u64 cr2 = (r->vector == 14u) ? fe_read_cr2() : 0;`）
 与 `idt.c:347`（`fe_user_resolve_fault(task, cr2, r->error)`）。
 所以 `fe_fault_cr2`/`fe_fault_error` 是**当初预留、后来没走那条路**留下的空声明——
 **谁把它们当接口去调，就会在链接期得到 `undefined symbol`。**
@@ -134,13 +134,20 @@
 
 | # | 符号 | 声明处 | 谁在引用（会被炸的位置） | 严重度 |
 |---|---|---|---|---|
-| 1 | `strncmp` | `user/include/fe_user.h:883`、`user/include/posix/string.h:25` | `user/libposix/stdlib.c:224`（在 `getenv` 里） | ★★ **一用就炸** ★★ |
-| 2 | `strchr` | `user/include/fe_user.h:888`、`user/include/posix/string.h:27` | `user/libposix/string.c:86`/`:97`/`:107`（`strspn`/`strcspn`/`strtok_r` 一族）、`user/libposix/stdlib.c:240`（在 `setenv` 里） | ★★ **一用就炸**（引用方**已在 `.o` 里**，见下面那条机制） ★★ |
-| 3 | `strcpy` | `user/include/fe_user.h:884`、`user/include/posix/string.h:20` | 本轮全仓搜**无调用者** | 只是死声明 |
-| 4 | `strncpy` | `user/include/fe_user.h:885`、`user/include/posix/string.h:21` | 无调用者 | 只是死声明 |
-| 5 | `strcat` | `user/include/fe_user.h:886`、`user/include/posix/string.h:22` | 无调用者 | 只是死声明 |
-| 6 | `strncat` | `user/include/fe_user.h:887`、`user/include/posix/string.h:23` | ★ **无调用者，而且连内核侧都没有** ★（`kernel/lib/string.c` 也没有它） | 只是死声明（但它是**唯一一个"两头都没有"**的） |
+| 1 | `strncmp` | `user/include/fe_user.h:939`、`user/include/posix/string.h:25` | `user/libposix/stdlib.c:224`（在 `getenv` 里） | ★★ **一用就炸** ★★ |
+| 2 | `strchr` | `user/include/fe_user.h:944`、`user/include/posix/string.h:27` | `user/libposix/string.c:86`/`:97`/`:107`（`strspn`/`strcspn`/`strtok_r` 一族）、`user/libposix/stdlib.c:240`（在 `setenv` 里） | ★★ **一用就炸**（引用方**已在 `.o` 里**，见下面那条机制） ★★ |
+| 3 | `strcpy` | `user/include/fe_user.h:940`、`user/include/posix/string.h:20` | 本轮全仓搜**无调用者** | 只是死声明 |
+| 4 | `strncpy` | `user/include/fe_user.h:941`、`user/include/posix/string.h:21` | 无调用者 | 只是死声明 |
+| 5 | `strcat` | `user/include/fe_user.h:942`、`user/include/posix/string.h:22` | 无调用者 | 只是死声明 |
+| 6 | `strncat` | `user/include/fe_user.h:943`、`user/include/posix/string.h:23` | ★ **无调用者，而且连内核侧都没有** ★（`kernel/lib/string.c` 也没有它） | 只是死声明（但它是**唯一一个"两头都没有"**的） |
 | 7 | `user/libposix/string.c:5-7` 的**过时注释** | `user/libposix/string.c:5-7` 逐字："memcpy/memset/memcmp/strlen/strcmp/strcpy/strncpy/strcat/strncat/strchr/strrchr/strncmp **已经在 libfe 里实现过一份**" | ★ **实测 libfe 只实现了 5 个**：`llvm-nm` 在 `build/obj/user/user/libfe/libfe.c.o` 里只看到 `memcmp`/`memcpy`/`memset`/`strcmp`/`strlen` ★ | ★ **可疑（这是"注释骗人"）** ★ |
+
+★★ **上表第 1 列的 `fe_user.h` 行号在本次审计期间挪过一次（883→939 等），原因是另一个代理在改那个文件** ★★
+第一版记的是 `883`/`884`/`885`/`886`/`887`/`888`/`889`（当时正确），
+几十分钟后复核时同一个文件里这 7 行整体下移了 56 行（**内容一字未变**）。
+★ 所以本表**同时给"文件 + 行号 + 符号名"**：只有符号名是稳的。
+这条不是理论——它是本轮**实测**到的第二次行号腐烂（第一次是 `ipc.c`，见下面方法提醒）。★
+（`user/include/posix/string.h` 那一列**没有**变，因为它没被人改。）
 
 ★★ **为什么 `strncmp`/`strchr` 今天没把构建打红——机制在这里** ★★
 不是"没人写那行代码"这么简单。真实机制是**按节回收 + 按节解析**：
@@ -175,14 +182,20 @@
 ★ 它们与第 1、2 条**性质不同**：诊断计数器的"读"可以是"人肉读"（打印出来看），
 而 `wait_index` / `shared` 连**赋值**都没有——**它们是纯占位** ★
 
-★★ **一条方法上的提醒（这是本轮踩到的）** ★★
-上表第一次写出来时，`process.c` / `fault.c` / `ipc.c` 的**行号是错的**——
-不是抄错，是**在我核对期间 `kernel/ipc/ipc.c` 又被那个正在做 K11 的代理改了**
-（同一个文件、同一天）。所以**代码里的行号是易腐的引用**：
-凡是能写成"**函数名 + 行号**"的，一律写成两者都给（本表已经这么做）。
+★★ **一条方法上的提醒（这是本轮踩到的，而且踩了两次）** ★★
+- **第一次**：上表第一次写出来时，`process.c` / `fault.c` / `ipc.c` 的**行号是错的**——
+  不是抄错，是**在我核对期间 `kernel/ipc/ipc.c` 又被那个正在做 K11 的代理改了**
+  （同一个文件、同一天）。
+- **第二次**：第②类表里 `user/include/fe_user.h` 的 7 行（`883`→`939` 一族）
+  **在审计期间整体下移了 56 行**，内容一字未变——那个文件也在被别人改。
+
+所以**代码里的行号是易腐的引用**：凡是能写成"**函数名/符号名 + 行号**"的，
+一律写成两者都给（本表已经这么做）。
 ★ 这与本轮修 MSI-X 注释时踩的是同一个坑：我在注释里写 `:930`，
 而我自己的编辑把它推到了 `:946` ★
 （`16-selfhost-path.md` 那条链的审计里记过同一件事）。
+★ 结论：**审计报告里的行号必须带"复核时间"的心态读**——
+本表的价值在"符号名 + 判据 + 严重度"，行号只是当时的定位辅助。★
 
 ★★ **与本行原记录不符的一处：`wait_satisfied` 现在有读者了** ★★
 本行原先（以及 `21-user-address-wait.md` 的字段表）记的是
