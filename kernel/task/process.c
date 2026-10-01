@@ -24,6 +24,9 @@
 #include <fe/resource.h>        /* fe_resource_note_init：谁是引导者 */
 #include <fe/io.h>
 #include <fe/protect.h>
+#include <fe/regs.h>            /* struct fe_regs：exec 要改这次 syscall 的返回帧 */
+#include <fe/fpu.h>             /* fe_fpu_area_alloc/free：跨映像不泄漏 FPU 状态 */
+#include <fe/mm/vma.h>          /* 候选区间表：fe_vma_table_init */
 
 /* ------------------------------------------------------------------ */
 /* 初始栈（Linux x86-64 约定）                                          */
@@ -422,6 +425,176 @@ void fe_process_on_thread_exit(struct fe_thread *t)
         task->waiter = NULL;
         fe_sched_wake(w);
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* 替换映像（K6：exec）                                                */
+/* ------------------------------------------------------------------ */
+
+/* ★ 用新映像替换**当前程序**：身份不变、映像变（docs/15-exec.md §2）★
+ *
+ * 句柄表 / 设备认领 / devfs 名字 / 任务 id / 父子关系一个字都不动，
+ * 换掉的是：地址空间、区间表、三个分配指针、返回帧里的入口与栈、
+ * 任务上的 TLS 模板、调用线程的 TLS 块与 FPU 状态区。
+ *
+ * ★ 两段式：**先准备，后提交**（§4）★
+ * 准备阶段（可能在任一一步失败）**绝不碰任务对象**——失败时原程序必须
+ * 完好无损地接着跑。所有"可能失败的"事都在前半段做完；后半段除了
+ * "杀其它线程"那一步之外都是不能失败的操作。
+ *
+ * ★ 顺序钉死（§4/§6.4/§6.6/§6.7）★
+ *   准备成功 → 杀其它线程并等它们死透 → 换 CR3 → 挂候选现场 →
+ *   重建调用者 TLS（**必须在挂现场之后**，它读 task->tls_*）→
+ *   换 FPU 状态区 → 写帧 → 改名 → **最后**放旧空间。
+ * 两个顺序错了都会炸：TLS 在挂现场之前重建 ⇒ 用旧映像的模板；
+ * 旧空间在换 CR3 之前释放 ⇒ 释放正在跑的页表（K2/K3 那次学费）。
+ *
+ * ★ `r` 是这次系统调用的返回帧 ★ 修改它 = 让"回到用户态"落在别处。
+ * 成功时本函数返回 FE_OK，但**调用者不会回到 syscall 的下一条指令**——
+ * 它从新映像的入口开始跑（帧里的 rax 是垃圾，见 §6.1）。 */
+fe_status_t fe_exec(struct fe_regs *r, const char *path,
+                    char *const argv[], u32 argc)
+{
+    if (!r || !path) {
+        return FE_ERR_INVAL;
+    }
+    struct fe_thread *self = fe_thread_current();
+    struct fe_task *t = fe_task_current();
+    if (!self || !t) {
+        return FE_ERR_INVAL;
+    }
+    /* ★ 只能由**主线程**发起 ★ 理由在 fe_task_kill_other_threads 的说明里：
+     * "杀掉其它线程"要把主线程排除在外，而"主线程退出即进程结束"这条语义
+     * （fe_process_on_thread_exit 只看主线程）是它安全的前提。 */
+    if (t->main_thread != self) {
+        return FE_ERR_INVAL;
+    }
+    if (argc > FE_ARGV_MAX) {
+        return FE_ERR_RANGE;
+    }
+
+    /* ★ 更新器身份：两个方向都要挡（§6.5）★
+     * 豁免是**按任务 id 钉死、先到先得、不可撤销**的，而 exec 否掉了
+     * "一个任务跑的就是它启动时那个映像"这条前提：
+     *   方向一：调用者就是更新器 ⇒ 它换了映像却仍然拿着豁免（撤不掉）；
+     *   方向二：新映像路径 == 更新器路径 ⇒ 它拿到了豁免（而 spawn 不会，
+     *           子任务是干净的）。
+     * 代价如实说：更新器**不能换映像**。将来真要支持，正确做法是在
+     * protect.c 里把豁免改成"跟着映像走"（加撤销/重新指定），
+     * 而不是让 exec 悄悄改变权限。 */
+    if (fe_protect_updater_task() != 0 &&
+        fe_protect_updater_task() == t->id) {
+        return FE_ERR_NOTSUP;
+    }
+    const char *upath = fe_protect_updater_path();
+    if (upath && upath[0] && strcmp(path, upath) == 0) {
+        return FE_ERR_NOTSUP;
+    }
+
+    /* ---------------- 准备（全部可能失败的事都在这里，不碰任务对象）------ */
+    struct fe_inode *ino = NULL;
+    fe_status_t st = fe_image_lookup(path, &ino);
+    if (fe_failed(st)) {
+        return st;
+    }
+    struct fe_address_space *new_as = fe_vmm_space_create();
+    if (!new_as) {
+        return FE_ERR_NOMEM;
+    }
+    struct fe_vma_table *new_vmas =
+        (struct fe_vma_table *)fe_kzalloc(sizeof(struct fe_vma_table));
+    if (!new_vmas) {
+        fe_vmm_space_destroy(new_as);
+        return FE_ERR_NOMEM;
+    }
+    fe_vma_table_init(new_vmas);
+
+    struct fe_new_image img;
+    st = fe_image_prepare(&img, new_as, new_vmas, ino, path, argv, argc);
+    if (fe_failed(st)) {
+        /* 半成品按准备阶段的规则整个扔掉；**原程序一个字都没被碰过** */
+        fe_vmm_space_destroy(new_as);
+        fe_kfree(new_vmas);
+        return st;
+    }
+
+    /* ---------------- 提交 ------------------------------------------------
+     * ★ 第一步是**唯一可能失败**的那一步（§4）★ 从此往下不能再失败。 */
+    fe_task_kill_other_threads(t, self);
+    if (fe_failed(fe_task_wait_others_dead(t, FE_EXEC_KILL_ROUNDS))) {
+        /* ★ 绝不 panic：这条路径用户态可触发（一个线程卡在没有取消点的
+         * 等待上、或睡在很长的 SLEEP 上），内核 panic 等于把它变成 DoS。 */
+        fe_task_dump_stuck_threads(t, self);
+        /* ★ 代价必须说清：kill_pending **不撤回** ★ 已经发出的"必须死"
+         * 没有回滚接口，进程会带着"少了一部分线程"继续跑——也就是说
+         * §4 那条"失败时原程序完好"从这里往后**不再成立**。 */
+        return FE_ERR_TIMEOUT;
+    }
+
+    /* K5 TODO 锚点（docs/18-user-fault-handler.md §6.1.5 对 K6 的要求）：
+     * 异常处理者的登记里，"端点"属**身份**（exec 不换句柄表，所以它跟着
+     * 任务活下来），而"现场缓冲区地址"与"收件线程"属**映像**。
+     * 默认保留 = 让新映像被一段不属于它的代码接管。所以提交阶段这里必须：
+     *   1) unref 掉登记里的端点（释放那次引用）；
+     *   2) 清掉三个字段（端点句柄 / 缓冲区基址 / 收件线程）；
+     *   3) `fault_depth = 0`；
+     * 之后新映像查询该登记时返回 **FE_ERR_NOENT**（不是 INVAL：INVAL 的
+     * 含义是"你参数写错了"，而这里的事实是"这个任务没有登记过处理者"）。
+     * ★ 今天 K5 的字段还不存在（task 上没有 fault_* 字段），所以这一条
+     * 现在**做不了**——K5 落地时必须在**这个位置**补上。写明在这里而不是
+     * 记在别处，是因为顺序与位置本身就是这条要求的一部分。 */
+
+    /* ★ ① 换 CR3 ★ 调度器不会替我们切（§6.7）：exec 之后当前线程没换，
+     * 只是它任务的 space 变了，而 fe_sched_maybe_switch 只在**换线程**时
+     * 比较两个任务的 space。 */
+    struct fe_address_space *old_as = t->space;
+    struct fe_vma_table *old_vmas = t->vmas;
+    fe_vmm_switch(img.as);
+
+    /* ★ ② 挂候选现场（一次挂全：space/vmas/三个指针/TLS 三元组）★ */
+    fe_task_attach_space(t, &img);
+
+    /* ★ ③ 重建调用者的 TLS 块 ★ **必须在 attach_space 之后**：它读
+     * task->tls_*，而那三个字段刚刚才换成新映像的模板。
+     * 先释放旧块——`fe_thread_tls_rebuild` 只负责分配新的并写回字段，
+     * 不负责释放旧的（在线程创建路径上旧块本来就不存在）。 */
+    if (self->user_tls) {
+        fe_kfree(self->user_tls);
+        self->user_tls = NULL;
+        self->user_fs_base = 0;
+        self->user_tls_size = 0;
+    }
+    fe_thread_tls_rebuild(self);
+
+    /* ★ ④ 换 FPU 状态区（§6.3）★ 不换就是**跨映像信息泄漏**：旧程序留在
+     * XMM/YMM 里的数据会被新映像的第一条 movaps 读出来，而用户态自己
+     * 清不掉（XRSTOR 要一块合法状态区，XCR0 是特权寄存器）。
+     * 分配失败时按 fpu.h 的约定走"恢复成干净状态"（NULL 区），
+     * **不允许**为了"保证有区"而继续用旧的那块。 */
+    fe_fpu_area_free(self->fpu_area);
+    self->fpu_area = fe_fpu_area_alloc();
+
+    /* ★ ⑤ 写帧 ★ rflags 必须置成规范值（§6.2）：留着旧程序的 DF 会让
+     * 新程序一进来就"字符串操作反向"，留着 TF/AC/IOPL 更是把旧映像的
+     * 权限位继承给一份可能不完全可信的新映像。CS/SS 不动（入口桩压进去
+     * 的固定用户选择子）。 */
+    r->rip = img.entry;
+    r->rsp = img.sp;
+    r->rflags = 0x202;      /* IF | 保留位 1，其余全清 */
+
+    /* ★ ⑥ 改名 ★ 不换的话 `ps` 会长期撒谎，而 ps 正是诊断工具。 */
+    strlcpy(t->name, img.name, FE_TASK_NAME_MAX);
+
+    /* ★ ⑦ 放旧空间 —— **必须在换 CR3 之后**（§6.6）★
+     * 反过来的写法是"释放正在跑的页表"。此刻我们跑在新空间里，而内核栈
+     * 在内核映射里（所有空间一致），所以现在释放旧的才是安全的。 */
+    if (old_as) {
+        fe_vmm_space_destroy(old_as);
+    }
+    if (old_vmas) {
+        fe_kfree(old_vmas);
+    }
+    return FE_OK;
 }
 
 /* ------------------------------------------------------------------ */

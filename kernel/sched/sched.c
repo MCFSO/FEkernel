@@ -343,6 +343,28 @@ static void setup_initial_frame_ring3(struct fe_thread *t, u64 entry, u64 user_s
  * 注意：`%fs` 基址必须是**当前地址空间下仍然有效的线性地址**。
  * 我们的内核映射在所有地址空间里完全一致（见 00-architecture §2），
  * 所以直接写内存对象的线性地址即可。 */
+/* ★ 导出成 fe_thread_tls_rebuild，供 `exec` 重建调用者的 TLS 块（K6）★
+ *
+ * ★ 为什么必须**导出**而不是让 exec 自己再写一份 ★
+ * "TLS 块长什么样"是一个已经写在两处的约定（`%fs:0` 指向块首、块首是数据段
+ * 起始，见 fe/user.h 的 FE_TLS_SELF_OFFSET 说明）。再抄一份就是第三处，
+ * 而三处不一致的症状是"线程局部变量读到别人的值"——那正是 fe_selftest_tls
+ * 当初为它写的那类错。exec 只调这一个函数。
+ *
+ * ★ 它读 task->tls_* ★ 所以 `exec` 的调用顺序必须钉死为：
+ * 先 `fe_task_attach_space(t, &img)`（把候选现场的 tls_* 挂上去）→ 再调本
+ * 函数。反过来会用**旧映像**的模板重建块。
+ *
+ * ★ 为什么它跨 CR3 切换仍然有效 ★ 块在内核堆上，而 `%fs` 基址是它的内核
+ * 线性地址；本内核的内核映射在**所有**地址空间里完全一致
+ * （00-architecture §2）。这条前提如果哪天变了，exec 与线程切换会同一天坏掉。 */
+static u64 thread_setup_user_tls(struct fe_thread *t);   /* 定义在下面 */
+
+u64 fe_thread_tls_rebuild(struct fe_thread *t)
+{
+    return thread_setup_user_tls(t);
+}
+
 static u64 thread_setup_user_tls(struct fe_thread *t)
 {
     /* ★ 每个线程都要有 TLS 块，包括内核线程 ★

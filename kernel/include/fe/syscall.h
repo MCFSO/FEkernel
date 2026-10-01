@@ -312,7 +312,22 @@ enum fe_syscall_num {
      * 只认自己分配的那个；别人的会返回 FE_ERR_ACCESS。 */
     FE_SYS_IRQ_MSI_FREE      = 0x8F,
 
-    FE_SYS_MAX              = 0x90,
+    /* 0x90 (path, argv, argc) —— 用新映像替换**当前程序**（K6）。
+     *
+     * ★ 身份不变、映像变 ★ 句柄表 / 设备认领 / devfs 名字 / 任务 id /
+     * 父子关系一个字都不动，只换地址空间与"当前跑的那份程序"。
+     *
+     * 参数形状与 FE_SYS_PROCESS_SPAWN **完全一致**（path/argv/argc），
+     * 因为两者干的是同一件事：把一份映像变成"正在跑的程序"。
+     *
+     * ★ 成功时**不返回** ★ 它改的是这次 syscall 的返回帧（rip/rsp/rflags），
+     * 于是"回到用户态"直接落在新映像的入口上。失败时返回负错误码，
+     * **原程序继续跑**（准备阶段的任何失败都不碰任务对象；唯一的例外是
+     * FE_ERR_TIMEOUT，那时杀那一步已经发生、不可回滚）。
+     * 设计与代价见 docs/15-exec.md。 */
+    FE_SYS_EXEC              = 0x90,
+
+    FE_SYS_MAX              = 0x91,
 };
 
 /* 资源类别，供 RESOURCE_LOCK/UNLOCK 与诊断使用。

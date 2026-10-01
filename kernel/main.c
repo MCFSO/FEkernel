@@ -680,6 +680,10 @@ FE_NORETURN void fe_kmain(void)
     f = fe_selftest_kill();      g_selftest_failures += f;
     fe_kprintf("        => 进程终止失败项: %u\n", f);
     fe_kprintf("\n");
+    fe_kprintf("[自检] 替换映像（K6：exec 要用的线程级叫停机制 E1-E5）:\n");
+    f = fe_selftest_exec();      g_selftest_failures += f;
+    fe_kprintf("        => 替换映像失败项: %u\n", f);
+    fe_kprintf("\n");
     fe_kprintf("[自检] FPU / SIMD（M10 前置）:\n");
     f = fe_selftest_fpu();       g_selftest_failures += f;
     fe_kprintf("        => FPU 失败项: %u（模式：%s）\n", f,

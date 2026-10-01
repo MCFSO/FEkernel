@@ -236,6 +236,17 @@ const char *fe_thread_wait_site(const struct fe_thread *t);
  * 它不改变任何线程的存活状态，也不释放任何东西。 */
 void fe_task_detach_threads(struct fe_task *task);
 
+/* ★ 重建一个线程的 TLS 块（`exec` 提交阶段用，K6）★
+ *
+ * 它按 `t->task->tls_*`（**新映像**的模板）重新分配并填充 `%fs` 那块，
+ * 写回 `t->user_tls` / `user_fs_base` / `user_tls_size`，返回新的 `%fs` 基址。
+ *
+ * ★ 调用顺序：必须在 `fe_task_attach_space()` **之后** ★ 否则用的是旧映像
+ * 的模板（症状：新程序读到的 `__thread` 变量还是旧程序的那一份）。
+ * ★ 为什么不让 exec 自己写一份 ★ 见 sched.c 里那段说明：TLS 布局的约定
+ * 已经写在两处，第三处必然漂移，而漂移的症状是"线程局部变量读到别人的值"。 */
+u64 fe_thread_tls_rebuild(struct fe_thread *t);
+
 /* ---- 线程枚举（TASK_LIST 快照用，见 kernel/arch/x86_64/syscall.c 的说明）----
  * 按"过滤全局线程链"实现，不额外维护每任务的线程链：
  * 唯一的那条链只有两处维护点（创建时插、销毁时摘），漏一处就是

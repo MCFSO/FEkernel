@@ -1086,6 +1086,45 @@ static i64 sys_process_spawn(u64 user_path, u64 user_argv, u64 argc)
     return (i64)h;
 }
 
+/* ★ K6：替换当前映像（`FE_SYS_EXEC`）★
+ *
+ * ★ 它是本内核第一个要**改返回帧**的系统调用 ★ 所以签名带 `struct fe_regs *r`
+ * ——"哪个系统调用会改现场"必须在调用点就看得见（docs/15-exec.md §3）。
+ * 参数校验与 `sys_process_spawn` **逐字复用同一套**：
+ * `fe_copy_str_from_user` + `copy_user_argv`，于是 `FE_ARGV_MAX` /
+ * `FE_ARG_MAX` / `FE_PATH_MAX` 只有一份定义（§5 那条"两次写同一件事必然出错"）。
+ *
+ * 成功时不返回：返回帧已经被 `fe_exec` 写成新映像的入口/栈/rflags。
+ * 这里返回的那个 0 只会落进 `r->rax`，而新程序**不看** rax（§6.1）。 */
+static i64 sys_exec(struct fe_regs *r, u64 user_path, u64 user_argv, u64 argc)
+{
+    struct fe_task *t = fe_task_current();
+    if (!t || !user_path) {
+        return FE_ERR_INVAL;
+    }
+    char path[FE_PATH_MAX];
+    fe_status_t s = fe_copy_str_from_user(path, (const char *)(uptr)user_path,
+                                          sizeof(path));
+    if (fe_failed(s)) {
+        return s;
+    }
+
+    char arena[FE_ARGV_MAX * FE_ARG_MAX];
+    char *argv[FE_ARGV_MAX + 1];
+    memset(argv, 0, sizeof(argv));
+    if (argc) {
+        s = copy_user_argv(user_argv, (u32)argc, arena, sizeof(arena), argv);
+        if (fe_failed(s)) {
+            return s;
+        }
+    }
+    s = fe_exec(r, path, argv, (u32)argc);
+    if (fe_failed(s)) {
+        return s;
+    }
+    return FE_OK;
+}
+
 static i64 sys_process_wait(u64 task_handle, u64 user_status)
 {
     struct fe_task *t = fe_task_current();
@@ -1437,6 +1476,12 @@ void fe_syscall_dispatch(struct fe_regs *r)
         break;
     case FE_SYS_PROCESS_SPAWN:
         ret = sys_process_spawn(a1, a2, a3);
+        break;
+    case FE_SYS_EXEC:
+        /* ★ 唯一一个**拿到返回帧**的分发分支 ★ 它可能改 r->rip/rsp/rflags，
+         * 于是这一次 syscall 的返回落在新映像的入口上（成功时不返回）。
+         * 与其它分支的区别必须在这里看得见——这正是签名带 r 的理由。 */
+        ret = sys_exec(r, a1, a2, a3);
         break;
     case FE_SYS_PROCESS_WAIT:
         ret = sys_process_wait(a1, a2);

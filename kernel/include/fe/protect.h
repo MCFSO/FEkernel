@@ -110,6 +110,18 @@ u32 fe_protect_load_manifest(const char *text, u64 len, char boot_slot);
  * 只能由拿着清单的那一方决定。 */
 void fe_protect_note_process(const char *path, u64 task_id);
 
+/* ★ 只读访问器：更新器身份的两个事实（`exec` 的两方向拒绝要用）★
+ *
+ * `exec` 会否掉"一个任务跑的就是它启动时那个映像"这条前提，而更新器豁免
+ * 正是**按任务 id 钉死、先到先得、不可撤销**的（见 fe_protect_note_process）。
+ * 所以 `exec` 必须两方向都挡：
+ *   - 调用者是当前更新器任务（拿了豁免却换了映像）→ 拒绝；
+ *   - 新映像路径 == 清单里的更新器路径（换了映像却想拿豁免）→ 拒绝。
+ * 第二个判断需要那条**路径**，而 `g_updater_path` 在 protect.c 里是 static。
+ * 没有"让进程自报"这一类接口——豁免只能由拿着清单的内核指定。 */
+u64 fe_protect_updater_task(void);          /* 0 = 还没有 */
+const char *fe_protect_updater_path(void);  /* "" = 清单里没有更新器 */
+
 bool fe_protect_active(void);
 
 u64 fe_protect_extent_count(void);

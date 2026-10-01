@@ -57,6 +57,20 @@ void fe_protect_note_process(const char *path, u64 task_id)
                "只有它能碰另一个槽\n", (unsigned long long)task_id, path);
 }
 
+/* ★ 只读访问器：`exec` 的两方向拒绝要用（见 fe/protect.h 的说明）★
+ * 豁免是**按任务 id 钉死、先到先得、不可撤销**的，而 `exec` 否掉了
+ * "一个任务跑的就是它启动时那个映像"这条前提——两个方向都得挡，
+ * 第二个方向（新映像路径 == 更新器路径）需要这条路径字符串。 */
+u64 fe_protect_updater_task(void)
+{
+    return g_updater_task;
+}
+
+const char *fe_protect_updater_path(void)
+{
+    return g_updater_path;
+}
+
 void fe_protect_init(void)
 {
     memset(g_extents, 0, sizeof(g_extents));

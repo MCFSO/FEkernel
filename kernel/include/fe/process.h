@@ -192,6 +192,26 @@ void fe_task_dump_stuck_threads(struct fe_task *task, struct fe_thread *keep);
  * 见 docs/13-tasks-and-kill.md §6.3）。 */
 u32 fe_task_cleanup_probes(struct fe_task *task, const char *tag);
 
+/* ---- K6：替换映像（exec）----
+ *
+ * 用 `path` 那份映像替换**当前程序**（当前任务当前跑的那份）。
+ * 身份（句柄表 / 资源认领 / devfs 名字 / 任务 id / 父子关系）一个字不动。
+ *
+ * ★ `r` 是这次系统调用的返回帧 ★ 成功时本函数把 `rip/rsp/rflags` 写成
+ * 新映像的入口、栈与规范 rflags，于是"回到用户态"直接落在新程序上——
+ * **成功时不返回到 syscall 的下一条指令**。`r->rax` 在新程序入口处是垃圾
+ * （新程序只认栈上的 argc/argv，见 docs/15-exec.md §6.1）。
+ *
+ * 失败时返回负错误码，**原程序完好无损地继续跑**——唯一的例外是
+ * `FE_ERR_TIMEOUT`：那时"杀其它线程"已经发生且**不可回滚**，进程已经残缺
+ * （被标记的线程下一次经过闸门时死掉）。
+ *
+ * 调用者必须先按 ABI 把 path/argv 拷进内核缓冲（见 syscall.c 的
+ * `fe_copy_str_from_user` / `copy_user_argv`），本函数只认内核指针。 */
+struct fe_regs;
+fe_status_t fe_exec(struct fe_regs *r, const char *path,
+                    char *const argv[], u32 argc);
+
 /* 内核从 cmdline 解析出的引导槽（'a' 或 'b'；没有 cmdline 时是 'a'）。
  * 它同时决定 exec 哪个 init、以及 A/B 访问矩阵里哪个槽"正在运行"。 */
 char fe_boot_slot(void);
@@ -204,5 +224,9 @@ u32 fe_selftest_process(void);
 
 /* 进程终止（K2）的自检：三条死亡路径 + 反向对照。返回失败项数。 */
 u32 fe_selftest_kill(void);
+
+/* 替换映像（K6）的自检：E1–E5（叫停其它线程 / 调用者未受伤 / 死透后不再占
+ * CPU / 三条取消点 / 任务级终止仍一次全杀）。返回失败项数。 */
+u32 fe_selftest_exec(void);
 
 #endif /* FE_PROCESS_H */
