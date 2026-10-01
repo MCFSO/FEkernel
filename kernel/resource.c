@@ -823,9 +823,23 @@ static void probe_d2_lock(void *arg)
 #define D4_ROLE_HOLD_AND_EXIT 1     /* 拿住 slot_d4 的锁，然后自己退出 */
 #define D4_ROLE_HOLD_AND_STAY 2     /* 拿住 slot_a0 的锁，一直握着（反向对照②）*/
 #define D4_ROLE_WAIT          3     /* 阻塞在 slot_d4 的锁上 */
+/* ★ 受害者形态：拿住锁、**一直活着**，直到被 `fe_task_kill_other_threads`
+ * 叫停。这才是 `exec` 真正面对的形态（见 probe_d4 里的说明）。 */
+#define D4_ROLE_HOLD_UNTIL_KILLED 4
 
 static volatile u32 g_d4_holding;       /* 两个"持有"角色共用的到达标志 */
 static volatile u32 g_d4_exited;
+/* ★ D4 断言②的判据：**是谁**拿到了锁（不是"有没有人拿到"）★
+ *
+ * `CHECK(took != NULL)` 是**假绿**：只要锁被**任何**人拿走（那个没被杀的
+ * 持锁者、或别的探针），它也过。同一个文件里 D2① 已经改成钉身份的写法
+ * （`CHECK(took == c)`），这一处按同一条纪律改：
+ * **非 NULL 不是判据、等于谁才是**。
+ *
+ * ★ 身份由探针**自己**记（只在真的拿到锁时写）★
+ * 不能拿"我起了几个线程"去假定——"它到底有没有拿到"必须由它本人说。
+ * 用一个 u64 存指针（探针与自检是不同线程，volatile 保证写得可见）。 */
+static volatile u64 g_d4_took_ptr;
 
 static void probe_d4(void *arg)
 {
@@ -837,6 +851,27 @@ static void probe_d4(void *arg)
         g_d4_exited = 1;
         fe_thread_exit(0);
     }
+    if (role == D4_ROLE_HOLD_UNTIL_KILLED) {
+        /* ★ 这才是 `exec` 真正走的那条路的受害者形态 ★
+         *
+         * ★ 为什么不能用 HOLD_AND_EXIT（实测踩到的坑）★
+         * 原来这里用的是"拿到锁就 `fe_thread_exit(0)`"。那个探针**自己**
+         * 在自检还没来得及调 `fe_task_kill_other_threads` 之前就已经死了——
+         * 于是"杀之前对受害者放锁"这一步**根本没被执行**，
+         * `lock_forget_thread_locks` 一次都没被调用（可以被静默地"通过"，
+         * 也可以像实测那样一直红）。两种都不是判据。
+         *
+         * `exec` 的受害者是**活着且在跑**的线程（它可能正握着锁算东西），
+         * 所以这里也让它活着：拿到锁之后一直自旋，直到被标记 → 下一次
+         * 被抢占时走到闸门 → 死。这样"放锁"必然发生在"它死之前"，
+         * 也就是这一刀真正要验的那个顺序。 */
+        if (fe_ok(fe_resource_lock(FE_RES_IOPORT, 0x80, 4, 0))) {
+            g_d4_holding = 1;
+        }
+        for (;;) {
+            fe_thread_yield();          /* 一直握着，直到被叫停 */
+        }
+    }
     if (role == D4_ROLE_HOLD_AND_STAY) {
         if (fe_ok(fe_resource_lock(FE_RES_IOPORT, 0xA0, 4, 0))) {
             g_d4_holding = 1;
@@ -846,7 +881,12 @@ static void probe_d4(void *arg)
         }
     }
     if (role == D4_ROLE_WAIT) {
-        (void)fe_resource_lock(FE_RES_IOPORT, 0x80, 4, 0);
+        i32 s = fe_resource_lock(FE_RES_IOPORT, 0x80, 4, 0);
+        /* 只有**真的拿到**（FE_OK）才记下自己：被取消而返回时不许记，
+         * 否则断言②会拿一个"其实没拿到锁"的线程去比。 */
+        if (s == FE_OK) {
+            g_d4_took_ptr = (u64)(uptr)fe_thread_current();
+        }
         fe_thread_exit(0);
     }
     fe_thread_exit(0);
@@ -1062,9 +1102,13 @@ static u32 selftest_d4_forget(void)
     g_d4_holding = 0;
     g_d4_exited = 0;
 
-    /* 任务 T：持锁者（受害者）与锁等待者（受害者）。 */
+    /* 任务 T：持锁者（受害者）与锁等待者（受害者）。
+     *
+     * ★ 持锁者用 HOLD_UNTIL_KILLED，不是 HOLD_AND_EXIT ★
+     * 后者会自己先退出，于是"杀之前放锁"这一步根本不会被执行——
+     * 那样测出来的绿是假的（见 probe_d4 里的说明）。 */
     struct fe_thread *a = res_spawn_probe(t, "d4-hold", probe_d4,
-                                          (void *)D4_ROLE_HOLD_AND_EXIT);
+                                          (void *)D4_ROLE_HOLD_UNTIL_KILLED);
     if (!a || !wait_flag_ms(&g_d4_holding, 20)) {
         fe_kprintf("        D4 持锁探针没有拿到锁\n");
         fail++;
@@ -1136,21 +1180,34 @@ static u32 selftest_d4_forget(void)
                            "没被杀的持锁者都**没有**被放掉\n");
             }
             /* ★ 断言② ★ 另一个任务的线程随后必须能拿到这把锁。
-             * 判据用 holder 的转移（不依赖 B 与 Z 谁先跑）。 */
-            res_spawn_probe(z, "d4-z", probe_d4, (void *)D4_ROLE_WAIT);
+             *
+             * ★ 判据钉身份，不是"非 NULL"（原判据是假绿）★
+             * 原来写的是 `CHECK(took != NULL)`：只要锁被**任何**人拿走
+             * （那个没被杀的持锁者、或别的探针）它也过。现在改成
+             * "holder 必须等于那个**活着的**线程 zth"（见 g_d4_took_ptr
+             * 的说明）。 */
+            g_d4_took_ptr = 0;
+            struct fe_thread *zth =
+                res_spawn_probe(z, "d4-z", probe_d4, (void *)D4_ROLE_WAIT);
             struct fe_thread *took = NULL;
             for (u32 i = 0; i < 40 && !took; i++) {
                 fe_thread_sleep_ms(5);
                 took = fe_resource_lock_holder(FE_RES_IOPORT, 0x80, 4);
             }
-            CHECK(took != NULL);
-            if (!took) {
-                fe_kprintf("        **D4 失败**：锁没被放掉，另一个任务的线程"
-                           "拿不到（holder 仍为 NULL，B 仍 state=%u）\n",
+            struct fe_thread *claimed = (struct fe_thread *)(uptr)g_d4_took_ptr;
+            /* ★ 这一条才是判据：拿锁的必须是那个活线程 ★
+             * 只比指针、不解引用（死者可能已被回收）。 */
+            CHECK(took == zth);
+            if (took != zth) {
+                fe_kprintf("        **D4 失败**：锁的持有者**不是**那个活线程"
+                           "（holder=%p 期望 %p；自称拿到锁的是 %p；"
+                           "B 仍 state=%u）——判据是「等于谁」，不是「非 NULL」\n",
+                           (void *)took, (void *)zth, (void *)claimed,
                            b->state);
+                fail++;
             } else {
                 fe_kprintf("        D4 修复后：另一个任务的线程随后拿到了同一把锁"
-                           "（holder=%p）\n", (void *)took);
+                           "（holder == 那个活线程 %p）\n", (void *)took);
             }
         }
     }

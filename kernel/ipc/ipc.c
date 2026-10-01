@@ -6,6 +6,7 @@
 #include <fe/sched/sched.h>
 #include <fe/sched/thread.h>
 #include <fe/resource.h>        /* fe_resource_forget_thread_locks（D2① 的锁登记摘除） */
+#include <fe/task.h>            /* fe_task_clear_waiter（wait 的 waiter 槽摘除） */
 #include <fe/user.h>
 #include <fe/kprintf.h>
 #include <fe/panic.h>
@@ -808,6 +809,19 @@ void fe_thread_cancel(struct fe_task *task, struct fe_thread *victim)
      *   1. 真正该被唤醒的后来者永远拿不到锁（解锁唤醒的是这个陈旧登记）；
      *   2. 僵尸回收之后 `fe_sched_wake` 读的是已释放内存。 */
     fe_resource_forget_thread_locks(victim);
+    /* 路径 5：目标任务上的 `waiter` 槽（`fe_process_wait` 的登记）。
+     *
+     * ★ 与路径 3（通知的 waiter）完全同类，也是"只在正常唤醒时才清"★
+     * `child->waiter` 只在**孩子退出**时被清（`fe_process_on_thread_exit`）。
+     * 线程被取消时没人清它 ⇒ 线程返回 CANCELED、走闸门、死、僵尸被回收
+     * ⇒ 槽里是一根指向已释放内存的指针，下次孩子退出时
+     * `fe_process_on_thread_exit` 会拿它去 `fe_sched_wake`（读 `t->state`）
+     * ——use-after-free。
+     * 实测（本次修复前）：`D2②` 段落后那条 `CHECK(child->waiter == NULL)`
+     * 是**唯一**还红着的一项（`进程终止失败项: 1`）。
+     *
+     * ★ 判据是线程指针，不是"槽非空"★ 见 fe_task_clear_waiter 的说明。 */
+    fe_task_clear_waiter(victim);
     fe_irq_restore(flags);
 
     /* 唤醒放在关中断区间之外：fe_sched_wake 自己会关中断，

@@ -115,6 +115,21 @@ struct fe_task *fe_task_by_name(const char *name);
 /* 全局任务链的表头（TASK_LIST 快照按它遍历）。 */
 struct fe_task *fe_task_first(void);
 
+/* ★ 摘掉"某个线程正在等这个任务"的登记（wait 的第五处等待登记）★
+ *
+ * `fe_process_wait` 会把 `child->waiter` 设成自己再阻塞；而
+ * `fe_process_on_thread_exit` 是唯一会清它的地方（孩子退出时才清）。
+ * 于是线程**被取消**（而不是孩子退出）时，那个槽留着它——线程随后返回
+ * CANCELED、走闸门、死、僵尸被回收，槽里就是一根指向已释放内存的指针，
+ * 而下次孩子退出时 `fe_process_on_thread_exit` 会拿它去 `fe_sched_wake`
+ * （读 `t->state`）——一次 use-after-free。
+ *
+ * 与 D1 的 `nt->waiter` 是同一类缺陷的第五个落点。判据是**线程指针**：
+ * `child->waiter == t` 才清（`waiter` 是单槽，清错了会把别人的等待弄丢）。
+ * 需要扫全局任务链，因为 `fe_process_wait` 的调用者手里只有**子任务句柄**，
+ * 而"谁在等我"这个消息记在那**子任务**自己的结构里。 */
+void fe_task_clear_waiter(struct fe_thread *t);
+
 /* 把任务/线程快照按**共享 ABI**（见 fe/syscall.h 的 FE_TASK_*_X 常量）
  * 拼进 buf。返回写入的任务数；负数 = 错误
  * （FE_ERR_INVAL 参数非法 / FE_ERR_NOSPC 缓冲不够）。

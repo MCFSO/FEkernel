@@ -190,6 +190,29 @@ struct fe_task *fe_task_first(void)
     return g_all_tasks;
 }
 
+/* ★ 摘掉"某个线程正在等这个任务"的登记（见 fe/task.h 的说明）★
+ *
+ * ★ 为什么要扫整条任务链 ★
+ * 记着"谁在等我"的是**被等的那个任务**（`child->waiter`），而取消一个
+ * 线程时手里只有那个线程指针——它可能正等在任意一个任务上。单核、且
+ * 调用者（`fe_thread_cancel`）已经在关中断区间里，所以遍历是安全的。
+ *
+ * ★ 为什么判据必须是 `== t`（不能见着非 NULL 就清）★
+ * `waiter` 是单槽。清掉一个不属于 `t` 的登记，等于把**别人**的等待
+ * 弄丢——那个线程会永远睡在 `fe_process_wait` 里（比原缺陷更难查：
+ * 它连"槽里有个死指针"这种可观察的痕迹都没有）。 */
+void fe_task_clear_waiter(struct fe_thread *t)
+{
+    if (!t) {
+        return;
+    }
+    for (struct fe_task *task = g_all_tasks; task; task = task->next) {
+        if (task->waiter == t) {
+            task->waiter = NULL;
+        }
+    }
+}
+
 void fe_task_dump_all(void)
 {
     fe_kprintf("  任务 ID  名称             句柄数\n");

@@ -662,6 +662,30 @@ u32 fe_task_kill_other_threads(struct fe_task *task, struct fe_thread *keep)
         }
         t->kill_pending = true;
         marked++;
+        /* ★ D4：**先放锁、再让它死**（docs/13-tasks-and-kill.md §6.2 第 2 条）★
+         *
+         * ★ 为什么必须在这里放锁 ★
+         * `lock_forget_owner` 只在**任务销毁**与资源转交里被调；而 `exec`
+         * 杀完线程之后**任务继续活着**（"身份不变、映像变"）。于是被杀线程
+         * 握着的那把共享区间控制器锁**再也不会被放掉**：
+         *   - 后来者一直等在 `fe_resource_lock` 上（实测 D4 输出：
+         *     `**D4 失败**：持锁线程已死，fe_resource_lock_holder() 仍返回
+         *     ...（已死线程）——后来者会一直等在这把锁上`）；
+         *   - 僵尸被回收之后 `lock_holder` 指向已释放内存，而
+         *     `lock_forget_owner` 会读 `e->lock_holder->task->id`——
+         *     一次 use-after-free。
+         *
+         * ★ 为什么放在置位与唤醒**之前** ★
+         * 顺序反过来会留一个窗口："受害者已收到死亡信号、锁还没放"——
+         * 这段时间里后来者会把自己登记成 waiter 然后阻塞，而那个登记
+         * 随后又要靠别人来摘。先放锁，后来者要么直接拿到、要么登记在
+         * 一个即将被唤醒的位置上。
+         *
+         * ★ 它只按**线程指针**匹配，不按 owner_id ★
+         * 所以不会顺手放掉 keep（同一个任务）握着的锁——那正是 D4
+         * 反向对照①要证伪的形态（"按任务放锁"会把调用者自己的锁也放掉）。
+         * 这个函数自己也关中断，可以安全地嵌在当前的关中断区间里。 */
+        fe_resource_forget_thread_locks(t);
         if (t->state == FE_THREAD_BLOCKED || t->state == FE_THREAD_SLEEPING) {
             /* 阻塞/睡眠中的线程自己走不到闸门，必须把它们摘下来 + 叫醒。 */
             fe_thread_cancel(task, t);
