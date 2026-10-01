@@ -333,9 +333,18 @@ FE_STATIC_ASSERT(sizeof(struct fe_fault_regs) > sizeof(struct fe_regs),
 回复走一个系统调用（不是消息，理由见本节末尾）：
 
 ```c
-/* fe/syscall.h：两个调用号（取号理由见 §4.1 那一行） */
-#define FE_SYS_FAULT_HANDLER 0x90   /* (ep_handle, regs_user_ptr) —— 登记 / 注销 */
-#define FE_SYS_FAULT_REPLY   0x91   /* (verdict, regs_user_ptr) —— 处理者的决定 */
+/* fe/syscall.h：两个调用号（取号理由见 §4.1 那一行）
+ *
+ * ★ 0x92/0x93 —— 这不是预留，是**确定的号**（2026-10-01 按读到的代码定死）★
+ * 本文写作时（2026-09-26）写的 `0x90`/`0x91` 已经被别人占掉了：
+ *   `0x90` = `FE_SYS_EXEC`（`kernel/include/fe/syscall.h:353`；
+ *           用户态镜像 `user/include/fe_user.h:116`）
+ *   `0x91` = `FE_SYS_MEM_PROTECT`（`kernel/include/fe/syscall.h:90`；
+ *           用户态镜像 `user/include/fe_user.h:74`）
+ * 而 `FE_SYS_MAX` 已经是 `0x92`（`kernel/include/fe/syscall.h:355`）。
+ * 所以 K5 落地时：两个号取 `0x92`/`0x93`，`FE_SYS_MAX` 从 `0x92` 走到 `0x94`。 */
+#define FE_SYS_FAULT_HANDLER 0x92   /* (ep_handle, regs_user_ptr) —— 登记 / 注销 */
+#define FE_SYS_FAULT_REPLY   0x93   /* (verdict, regs_user_ptr) —— 处理者的决定 */
 
 /* verdict（低 4 位是动作，高位是标志） */
 #define FE_FAULT_ACTION_MASK   0xFu
@@ -678,7 +687,7 @@ for (u32 i = 0; i < FE_FAULT_WAIT_ROUNDS; i++) {
 | 文件 | 改什么 | 为什么在这一处 |
 |---|---|---|
 | `kernel/include/fe/regs.h` | 新增 `struct fe_fault_regs` + 两条 `FE_STATIC_ASSERT`（§2.2.3） | 现场布局的唯一来源就在这个文件（`regs.h:1-16` 的推导），伴生结构放别处必然漂 |
-| `kernel/include/fe/syscall.h` | `FE_SYS_FAULT_HANDLER 0x90`、`FE_SYS_FAULT_REPLY 0x91`、`FE_SYS_MAX 0x91 → 0x92`；`FE_FAULT_*` 常量与"共享 ABI"说明；`FE_FAULT_REGS_SIZE_X` | 今天的 `FE_SYS_MAX` 是 `0x90`（`fe/syscall.h:293`），紧邻的值是空着的。★ 若 K6 `exec` 先落地，它会占 `0x90`（`15-exec.md:325`），K5 顺延到 `0x92/0x93` ★ |
+| `kernel/include/fe/syscall.h` | `FE_SYS_FAULT_HANDLER 0x92`、`FE_SYS_FAULT_REPLY 0x93`、`FE_SYS_MAX 0x92 → 0x94`；`FE_FAULT_*` 常量与"共享 ABI"说明；`FE_FAULT_REGS_SIZE_X` | ★ **2026-10-01 更新：号已经定死，不再"看情况顺延"** ★ 本文原写 `0x90/0x91`；实测 `0x90` 已被 `FE_SYS_EXEC` 占用（`fe/syscall.h:353`）、`0x91` 已被 `FE_SYS_MEM_PROTECT` 占用（`:90`），而 `FE_SYS_MAX` 已是 `0x92`（`:355`）。所以 K5 取 `0x92`/`0x93`，`FE_SYS_MAX` → `0x94` |
 | `kernel/include/fe/task.h` | `struct fe_task` 新增：处理者端点对象指针、用户现场缓冲地址、**收件线程指针**（§2.3.2）、`fault_depth` + `fault_owner`（§2.4）、`fault_seq`；再一个 `u64 fault_count_total`（诊断） | `task.h:19-82` 已经是"身份"的落点（`15-exec.md` §2），处理者是身份级的 |
 | `kernel/include/fe/sched/thread.h` | `struct fe_thread` 新增三项：`last_fault_rip`、`last_fault_cr2`（§2.5.2）、回复槽（`fault_reply` 小结构：verdict + 现场副本 + `arrived` 标志，§2.4） | 现场是**每线程**的，所以这份暂存必须在线程上。放任务上会在"两条线程同时出错"时互相踩 |
 | `kernel/include/fe/process.h` | 新增 `fe_fault_set_handler()` / `fe_fault_clear_handler()` / `fe_fault_deliver()` / `fe_fault_reply()` 的声明 | 与 `fe_task_terminate`（`process.h:147`）同一族：都是"任务级的语义改动" |
@@ -823,11 +832,17 @@ for (u32 i = 0; i < FE_FAULT_WAIT_ROUNDS; i++) {
 | 8 | 故障路径上打印的字符串是否要改成 ASCII | ⬜ 仍待查 | 与 §6.1.4 的耗时结论相邻，但判据在"谁在什么上下文调它"（§6.1.6 第 3 条） |
 
 ★ 原第 7 条（`exec` 是否落地 → syscall 取号）查清了，但它不属于本节：它记在 §4.1 的
-`fe/syscall.h` 那一行里——**我实测 K6 今天还没落地**（`user/bin/` 下没有 `exectest/`、
-`syscall.c` 的分发表里没有 `FE_SYS_EXEC`、`user/include/fe_user.h:102` 的常量表止于
-`FE_SYS_IRQ_MSI_FREE 0x8F`），而 `15-exec.md:325-326` 已把 `0x90` 许给了它。
-所以 K5 的取号规则是：**先看 `syscall.c` 的分发表，`0x90` 空着就取 `0x90/0x91`，
-被占了就顺延到 `0x92/0x93`**。
+`fe/syscall.h` 那一行里——**本文写作时我实测 K6 还没落地**（当时 `user/bin/` 下没有
+`exectest/`、`syscall.c` 的分发表里没有 `FE_SYS_EXEC`、`user/include/fe_user.h:102`
+的常量表止于 `FE_SYS_IRQ_MSI_FREE 0x8F`），而 `15-exec.md:325-326` 已把 `0x90`
+许给了它。所以当时写下的取号规则是"**先看 `syscall.c` 的分发表，`0x90` 空着就取
+`0x90/0x91`，被占了就顺延到 `0x92/0x93`**"。
+
+★ **2026-10-01 复核：`exec` 已经落地，号不再需要"看情况"** ★
+按读到的代码核实：`FE_SYS_EXEC = 0x90`（`kernel/include/fe/syscall.h:353`，
+用户态镜像 `user/include/fe_user.h:116`）、`FE_SYS_MEM_PROTECT = 0x91`
+（`fe/syscall.h:90`，镜像 `fe_user.h:74`）、`FE_SYS_MAX = 0x92`（`fe/syscall.h:355`）。
+→ **K5 的两个号确定为 `0x92`/`0x93`，`FE_SYS_MAX` → `0x94`**（与 §4.1 的那一行一致）。
 
 #### 6.1.1 第 1 条：`fe_user_fault_count` / `fe_last_user_fault_vector` 的消费者只有一个
 
@@ -1044,7 +1059,7 @@ K5 引入。它的存在理由写在它自己的注释里（`:110-115`：装载�
 
 ### 6.2 代价清单（一句话版）
 
-1. 两个 syscall 号（`0x90`/`0x91`，可能顺延）、一个 200 字节的共享 ABI（两边各一份镜像 + `_Static_assert`）；
+1. 两个 syscall 号（`0x92`/`0x93`——**已定死**，见 §4.1）、一个 200 字节的共享 ABI（两边各一份镜像 + `_Static_assert`）；
 2. `struct fe_task` 多 5 个字段（其中一个是对象指针，**必须**在销毁路径上 `unref`）：处理者端点、现场缓冲地址、收件线程指针、`fault_depth`+`fault_owner`、`fault_seq`；`struct fe_thread` 多 3 个字段（两个 `u64` 现场记忆 + 一个回复槽）；
 3. `user_fault` 从"两条出口"变成"四条出口"（按需分页 / 投递 / 闸门杀 / 照旧杀）——**这是本文结构上最贵的一处**，因为它是异常分发里唯一一个多分支的地方，而 `idt.c:290-305` 那段注释记着"漏一个 `return` 就把成功当致命"的实测事故。代价的形态是**可读性**，缓解手段只能是注释与自检（§5.1 的 F2/F3 各堵一条出口）；
 4. 出错线程在等待期间**占用一个时间片空转**（§2.6.3）。它是"有界"的，但一个高频出错的进程会让 CPU 空转——**这是处理者自己的责任**，内核只保证有界；
