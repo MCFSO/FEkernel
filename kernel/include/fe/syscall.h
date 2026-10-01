@@ -352,7 +352,15 @@ enum fe_syscall_num {
      * 设计与代价见 docs/15-exec.md。 */
     FE_SYS_EXEC              = 0x90,
 
-    FE_SYS_MAX              = 0x92,
+    /* 0x92 / 0x93 —— 用户态异常处理者（K5），语义见下面那段共享 ABI 注释。
+     *
+     * ★ 号已经定死，不再"看情况顺延" ★ docs/18 §4.1 原本写 0x90/0x91，
+     * 但实测 0x90 已被 FE_SYS_EXEC 占用、0x91 已被 FE_SYS_MEM_PROTECT 占用
+     * （本文件 :90），而 FE_SYS_MAX 已经是 0x92。 */
+    FE_SYS_FAULT_HANDLER    = 0x92,  /* (ep_handle, regs_user_ptr) 登记 / 注销 */
+    FE_SYS_FAULT_REPLY      = 0x93,  /* (verdict, regs_user_ptr) 处理者的决定 */
+
+    FE_SYS_MAX              = 0x94,
 };
 
 /* ---- 用户态异常处理者（K5）的共享 ABI ----
@@ -387,6 +395,26 @@ enum fe_syscall_num {
 #define FE_FAULT_KILL          2u    /* 我不管：照旧杀线程（今天的行为） */
 #define FE_FAULT_RETHROW       3u    /* 再抛一次：让本线程再走一轮投递 */
 #define FE_FAULT_FLAG_KEEP_REGS 0x10u /* 与 RESUME 同用：现场用原来的，不改 */
+
+/* ---- 两条系统调用的逐条语义 ----
+ *
+ *   FE_SYS_FAULT_HANDLER(ep_handle, regs_user_ptr)
+ *       ep_handle != 0 → **登记**：这个任务以后的用户态异常投给这个端点；
+ *                        `regs_user_ptr` 是内核拷现场用的用户缓冲区
+ *                        （登记时当场校验：必须已映射且可写）。
+ *                        收件线程 = **调用线程**（§2.3.2"谁登记谁收"）。
+ *       ep_handle == 0 → **注销**：返回值回答"注销掉了一个吗"——
+ *                        `FE_OK` = 有、`FE_ERR_NOENT` = 本来就没有。
+ *                        ★ 这也是"我还有处理者吗"的查询形状 ★
+ *                        （docs/18 §6.1.5 要求 exec 之后问一次必须得到
+ *                        `NOENT`——`NOENT` 说"登记不在了"，`INVAL` 说
+ *                        "你参数写错了"，两者含义不同）。
+ *
+ *   FE_SYS_FAULT_REPLY(verdict, regs_user_ptr)
+ *       `regs_user_ptr` 指向处理者**收到的那一份** `struct fe_fault_regs`：
+ *       它必须把两个只读字段（`thread_id`、`fault_count`）**原样带回**，
+ *       回复才被认账（§2.3 的 `(task_id, thread_id, fault_seq)` 三项校验，
+ *       见 `fe_fault_reply`）。`NOENT` = 这个任务没有登记过处理者。 */
 
 /* 资源类别，供 RESOURCE_LOCK/UNLOCK 与诊断使用。
  * 数值与 fe/resource.h 的 enum fe_res_kind 一致。 */

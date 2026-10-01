@@ -97,6 +97,41 @@ static void fail(const char *what, long code)
 }
 
 /* ------------------------------------------------------------------ */
+/* K5：exec 必须清掉异常处理者的登记（docs/18 §6.1.5 对 K6 的要求）      */
+/* ------------------------------------------------------------------ */
+
+/* 与内核 fe/errno.h 的 FE_ERR_NOENT 是同一个数。用户态今天没有 errno 头，
+ * 所以写死一个数——但写成符号，好让"这个 -3 是什么"一眼可见。 */
+#define EXEC_ERR_NOENT  (-3)
+
+/* 登记用的现场缓冲区。**必须是已映射且可写的用户地址**（登记时内核当场
+ * 校验，见 sys_fault_handler）；ELF 装载器把每个 PT_LOAD 段整段映射好
+ * （含 .bss 尾部，与下面 g_probe_page 那条理由相同），所以一个静态变量够用。 */
+static struct fe_fault_regs g_fault_regs;
+
+/* exec **之前**登记一个异常处理者。
+ * 收件线程 = 调用线程（main）——本模式不打算真的出错，登记存在的唯一意义
+ * 是给 exec 之后的查询留一个"没被清掉就会看得见"的东西。
+ * 返回失败项数（0 = 成功）。 */
+static int register_probe_handler(void)
+{
+    memset(&g_fault_regs, 0, sizeof(g_fault_regs));   /* 登记之前先碰一次 */
+    long ep = fe_endpoint_create(0);
+    if (ep < 0) {
+        fail("K5/exec：endpoint_create 失败", ep);
+        return 1;
+    }
+    long rc = fe_fault_set_handler(ep, &g_fault_regs);
+    if (rc != 0) {
+        fail("K5/exec：登记异常处理者失败", rc);
+        return 1;
+    }
+    fe_puts("[exectest] K5/exec：exec 之前登记了一个异常处理者"
+            "（exec 之后新映像必须查不到它）\n");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* mprotect 探针：本程序 .data 里一个页对齐的页                        */
 /* ------------------------------------------------------------------ */
 
@@ -159,6 +194,11 @@ static int run_exec_modes(const char *self)
 
     /* ---------- 模式 A：fe_exec 自己，子模式退出 0x5A ---------- */
     fe_puts("[exectest] 模式 A：fe_exec 自己（期望子模式退出 0x5A）\n");
+    /* ★ K5：exec **之前**登记一个异常处理者 ★ 子模式会问一次
+     * "我还有处理者吗"，正确的答案是"没有"（提交阶段清掉了）。
+     * 不先登记就没有东西可清，那条断言会**假通过**——
+     * 这正是"每条正向都要配一条会失败的反向"的那条纪律。 */
+    fail_count += register_probe_handler();
     {
         char *av[3];
         av[0] = (char *)self;
@@ -373,6 +413,36 @@ int main(int argc, char **argv)
     /* ---------- 子模式：exec 的孩子 ---------- */
     if (argc >= 2 && argv[1] && strcmp(argv[1], "child") == 0) {
         fe_puts("[exectest] 子模式：新映像已经跑起来了（这就是 exec 成功的证据）\n");
+
+        /* ★ K5：exec 的提交阶段必须**清掉**异常处理者的登记 ★
+         * 登记里"处理者端点"属**身份**（exec 不换句柄表，所以它本来会跟着
+         * 任务活下来），而"现场缓冲区地址"与"收件线程"属**映像**——
+         * 默认保留就等于让新映像被一段**不属于它**的代码接管
+         * （docs/18 §6.1.5；与 `13-tasks-and-kill.md` §6.5 那条"按身份钉死的
+         * 授权，换映像必须显式处理"是同一条纪律）。
+         *
+         * 判据用"注销"这一个动作，因为它同时回答"本来有没有"：
+         *   返回  0        = 登记**还在** → 提交阶段没清（这条断言就红）
+         *   返回 -3(NOENT) = 没有登记   → 正确
+         * 为什么必须是 `NOENT` 而不是 `INVAL`：`NOENT` 说"登记不在了"，
+         * `INVAL` 说"你参数写错了"——而这里不是参数错。
+         *
+         * ★ 这一条**不能**放在 `--rollback` 那条路上 ★ 那条路的 exec
+         * **失败**（路径不存在），提交阶段根本没跑，登记理应还在。
+         * docs/18 §6.1.5 第 2 条写的是"模式 B 之后必须是 NOENT"，
+         * 那在本内核上不成立——成功换映像的才是模式 A/C。 */
+        long had = fe_fault_set_handler(0, NULL);
+        if (had == 0) {
+            fail("K5/exec：exec 之后登记**还在**（提交阶段没清）", had);
+            return 0x51;
+        }
+        if (had != EXEC_ERR_NOENT) {
+            fail("K5/exec：exec 之后注销返回的不是 NOENT(-3)", had);
+            return 0x52;
+        }
+        fe_printf("[exectest] K5/exec：新映像查询处理者 -> NOENT(%ld)，"
+                  "登记已被提交阶段清掉\n", had);
+
         /* ★ 这里用了一次 printf 与一次 puts：它们都走 libfe，
          * 而 libfe 的 errno 是 __thread —— 能正常输出就说明**新 TLS 生效**。★ */
         fe_printf("[exectest] 子模式：argv[0]=%s argc=%d，即将 exit(0x5A)\n",

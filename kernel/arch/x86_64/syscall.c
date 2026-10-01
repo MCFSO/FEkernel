@@ -1443,6 +1443,92 @@ static i64 sys_fb_info(u64 user_out)
 }
 
 /* ------------------------------------------------------------------ */
+/* 用户态异常处理者（K5）：登记 / 注销 / 回复                            */
+/* ------------------------------------------------------------------ */
+
+/* 登记 / 注销。语义与理由见 fe/syscall.h 里那一段共享 ABI 注释。
+ *
+ * ★ 这个函数只做"校验用户指针 + 转发"★ 判据全在 `kernel/task/fault.c`
+ * 里（与 `sys_task_terminate` 同一层）。放这里的只有两件必须在这一层做的事：
+ *   1. **登记时当场校验缓冲区**：`fe_user_range_ok(space, buf, 200, true)`
+ *      要求它"已映射 + 可写"。留到投递时再发现的话，异常上下文里那次
+ *      `fe_copy_to_user` 会返回 FAULT，而那时能做的只有杀线程——
+ *      用户态会看到"我登记成功了，但一出事就被杀"，根因在几千行之外。
+ *      （这正是 docs/18 §5.3 里"用户程序取指 #PF 之后整个系统崩"那一行的
+ *      前置条件：登记时的指针校验必须当场做。）
+ *   2. `ep_handle == 0` 走注销，并把"本来有没有"翻译成
+ *      `FE_OK` / `FE_ERR_NOENT` —— 那正是 exec 之后要问的那一句
+ *      （docs/18 §6.1.5：`NOENT` 说"登记不在了"，`INVAL` 说"你参数写错了"）。 */
+static i64 sys_fault_handler(u64 ep_handle, u64 user_regs)
+{
+    struct fe_task *t = fe_task_current();
+    if (!t) {
+        return FE_ERR_INVAL;
+    }
+    if (ep_handle == 0) {
+        /* 注销：返回值回答"注销掉了一个吗"。 */
+        bool had = (t->handler_ep != NULL);
+        fe_fault_clear_handler(t);
+        return had ? FE_OK : FE_ERR_NOENT;
+    }
+    if (!user_regs) {
+        return FE_ERR_INVAL;
+    }
+    struct fe_object_header *obj = NULL;
+    /* ★ 只要求"句柄指着一个端点"，**不要求任何权限位** ★
+     * 登记之后内核持有的是**端点对象指针**加一次引用，投递走
+     * `fe_endpoint_send_obj`（不查句柄权限，见 kernel/ipc/ipc.c 那段说明）。
+     * 所以这里查权限等于发明一条"以后投递要不要权限"的假判据：
+     * 用户态随后把句柄权限收窄，投递照样工作。 */
+    fe_status_t s = fe_handle_lookup(&t->handles, (fe_handle_t)ep_handle, 0, &obj);
+    if (fe_failed(s)) {
+        return s;
+    }
+    if (obj->type != FE_OBJ_ENDPOINT) {
+        return FE_ERR_INVAL;
+    }
+    /* 缓冲区必须**当场**可写。只查不拷：这一页的内容等投递时才写。 */
+    if (!fe_user_range_ok(t->space, (virt_addr_t)user_regs,
+                          FE_FAULT_REGS_SIZE, true)) {
+        return FE_ERR_FAULT;
+    }
+    return fe_fault_set_handler(t, FE_OBJ_OF(obj, struct fe_endpoint),
+                                user_regs);
+}
+
+/* 处理者的决定。verdict 与"两个只读字段必须回显"见 fe/syscall.h。
+ *
+ * ★ 为什么这里要先把 `regs` 拷进内核栈 ★
+ * 回复的校验要看 `thread_id`/`fault_count` 两个字段；直接从用户指针读
+ * 会让校验与拷贝分成两次用户内存访问，中间用户态（另一条线程）可以改它。
+ * 拷一次、校验与落盘都用内核里那一份，这个窗口就没有了。 */
+static i64 sys_fault_reply(u64 verdict, u64 user_regs)
+{
+    struct fe_task *t = fe_task_current();
+    if (!t) {
+        return FE_ERR_INVAL;
+    }
+    if (!user_regs) {
+        return FE_ERR_INVAL;
+    }
+    /* ★ "没有登记过处理者"要报 NOENT，而不是 INVAL ★
+     * 这是 exec 之后唯一可观察的后果：新映像问一句"我还有处理者吗"。
+     * 两者对用户的含义不同，不能混（docs/18 §6.1.5 第 2 条）。
+     * 注意这一条必须排在 `fe_fault_reply` 之前：那个函数对
+     * "没有正在等的投递"与"登记不在了"都只能返回 INVAL。 */
+    if (!t->handler_ep) {
+        return FE_ERR_NOENT;
+    }
+    struct fe_fault_regs regs;
+    fe_status_t s = fe_copy_from_user(&regs, (const void *)(uptr)user_regs,
+                                      sizeof(regs));
+    if (fe_failed(s)) {
+        return s;
+    }
+    return fe_fault_reply(t, fe_thread_current(), &regs, verdict);
+}
+
+/* ------------------------------------------------------------------ */
 /* 分发                                                                */
 /* ------------------------------------------------------------------ */
 
@@ -1611,6 +1697,12 @@ void fe_syscall_dispatch(struct fe_regs *r)
     case FE_SYS_PF_STAT:
         /* 按需分页累计解析次数。诊断用，无参数、无失败路径。 */
         ret = (i64)fe_pf_resolved_count();
+        break;
+    case FE_SYS_FAULT_HANDLER:
+        ret = sys_fault_handler(a1, a2);
+        break;
+    case FE_SYS_FAULT_REPLY:
+        ret = sys_fault_reply(a1, a2);
         break;
     default:
         fe_kprintf("[syscall] 未知调用号 %llu (线程 %s)\n",

@@ -114,6 +114,29 @@
  * 参数形状与 fe_spawn 完全一致（path/argv/argc）；argv[0] 由调用者给，
  * 内核不替它填。 */
 #define FE_SYS_EXEC             0x90
+/* ★ 用户态异常处理者（K5）★ 与内核 fe/syscall.h 的
+ * `FE_SYS_FAULT_HANDLER` / `FE_SYS_FAULT_REPLY` 逐个对应。
+ *
+ *   FE_SYS_FAULT_HANDLER(ep_handle, regs_user_ptr)
+ *       ep_handle != 0 → 登记（收件线程 = **调用线程**，"谁登记谁收"）；
+ *                        缓冲区必须已映射且可写，登记时当场校验。
+ *       ep_handle == 0 → 注销；返回值 `0` = 注销掉了、`-3`(`FE_ERR_NOENT`)
+ *                        = 本来就没有。**这也是"我还有处理者吗"的查询**。
+ *   FE_SYS_FAULT_REPLY(verdict, regs_user_ptr)
+ *       处理者的决定。`regs_user_ptr` 指向**收到的那一份**现场，
+ *       两个只读字段（`thread_id`/`fault_count`）必须原样带回。
+ *       `-3`(`FE_ERR_NOENT`) = 这个任务没有登记过处理者。
+ *
+ * 设计与代价见 docs/18-user-fault-handler.md。 */
+#define FE_SYS_FAULT_HANDLER    0x92
+#define FE_SYS_FAULT_REPLY      0x93
+
+/* 处理者的决定（FE_SYS_FAULT_REPLY 的第一个参数）。低 4 位是动作。 */
+#define FE_FAULT_ACTION_MASK    0xFu
+#define FE_FAULT_RESUME         1u    /* 已处理：按我给的现场继续跑 */
+#define FE_FAULT_KILL           2u    /* 我不管：照旧杀线程（默认行为） */
+#define FE_FAULT_RETHROW        3u    /* 再抛一次：让本线程再走一轮投递 */
+#define FE_FAULT_FLAG_KEEP_REGS 0x10u /* 与 RESUME 同用：现场用原来的，不改 */
 
 /* 资源类别（与内核 fe/syscall.h 一致） */
 #define FE_RES_IOPORT 1u
@@ -680,6 +703,87 @@ long fe_wait(long task_handle, int *out_status);
  *      超时（FE_ERR_TIMEOUT）之后进程已经少了线程。
  * 设计与代价见 docs/15-exec.md。 */
 long fe_exec(const char *path, char *const argv[], u32 argc);
+
+/* ★ 用户态异常处理者（K5）：投递给处理者的那**一份现场** ★
+ *
+ * ★ 顺序与内核 `struct fe_regs` **逐字段一致**，只在尾部多三项 ★
+ * 前 22 个字段就是内核压栈的那份现场，只是把两个"内核内部记账"的名字换了：
+ *   `vector`（异常向量号）、`error_code`（CPU 压入的错误码；无错误码的向量为 0）。
+ * 于是"现场怎么摆"只有一个来源（`kernel/include/fe/regs.h` 的布局推导），
+ * 而处理者拿到的仍然是一份**完整**现场。
+ *
+ * ★ 尾部三项里有**两个只读字段**，回 `FE_SYS_FAULT_REPLY` 时必须原样带回 ★
+ *   - `thread_id`：出错线程的 id。处理者要按线程分流时用它；同时它是
+ *     内核判断"你回的这份现场属于哪条线程"的依据——改了就拒
+ *     （防"跨线程现场伪装"）；
+ *   - `fault_count`：**本线程**第几次被投递（含本次，从 1 起）。
+ *     它同时是"回复的是哪一轮"的配对号——同样必须原样带回。
+ * `cr2` 只有 `#PF`（向量 14）有意义，其余向量为 0。
+ *
+ * ★ 内核**不替你推进 `rip`** ★ 故障类异常（`#PF`/`#UD`/`#DE`/`#GP`）压栈的
+ * `rip` 指向**出错的那条指令本身**，所以"跳过这条指令往下跑"是处理者的事：
+ * 你自己知道那条指令多长，就自己加上去；不知道就回 `FE_FAULT_KILL`，
+ * **不要猜**。
+ *
+ * ★ 处理者不能依赖任何"第一次访问才映射"的内存 ★
+ * 它的栈、代码、日志缓冲、`malloc` 出来的堆页，**都必须在登记处理者之前
+ * 已经映射好**——按需分页救不了处理者自己：处理者内部再出错就是
+ * "投递深度 1"到场，那条线程直接被杀（见下面 `fe_fault_set_handler` 的说明）。 */
+struct fe_fault_regs {
+    u64 r15, r14, r13, r12, r11, r10, r9, r8;
+    u64 rbp, rdi, rsi, rdx, rcx, rbx, rax;
+    u64 vector;         /* 0..31：异常向量号 */
+    u64 error_code;     /* CPU 压入的错误码；无错误码的向量由桩补 0 */
+    u64 rip, cs, rflags, rsp, ss;
+    /* ---- 下面是"现场"之外、但缺了就处置不了的三项 ---- */
+    u64 cr2;            /* 出错线性地址；只有 #PF(14) 有意义，其余为 0 */
+    u64 thread_id;      /* 出错线程 id（只读：回复时必须原样带回）*/
+    u64 fault_count;    /* 本线程第几次被投递，从 1 起（只读，同上）*/
+};
+
+/* 两侧各自把字节数钉住。数值写成"字段数 × 8"而不是字面量：
+ * 改一个字段没改断言时，编译器会说"结构体大小变了"——而**宏与结构体对不上**
+ * 正是 docs/13-tasks-and-kill.md §2 记的那次实测事故（步长写成 48、实际 64）。 */
+_Static_assert(sizeof(struct fe_fault_regs) == 25 * 8,
+               "fe_fault_regs 布局变了（内核按 200 字节写）");
+#define FE_FAULT_REGS_SIZE  200u  /* 与内核 FE_FAULT_REGS_SIZE 同一个数 */
+#define FE_FAULT_REGS_SIZE_X 200u
+_Static_assert(sizeof(struct fe_fault_regs) == FE_FAULT_REGS_SIZE_X,
+               "FE_FAULT_REGS_SIZE_X 与 struct fe_fault_regs 不一致");
+
+/* 投递事件的消息头常量（与内核 fe/syscall.h 一致）。
+ * 事件是一条**没有载荷**的消息：现场在你自己给的那个缓冲区里。
+ * `hdr.payload_len == 0`、`hdr.handle_count == 0`，按 `protocol`/`opcode` 过滤。 */
+#define FE_FAULT_PROTO    0x4641554Cu  /* 'FAUL' */
+#define FE_FAULT_OP_EVENT 1u
+
+/* ★ 登记 / 注销异常处理者 ★
+ *
+ *   fe_fault_set_handler(ep, regs)   ep != 0：登记；返回 0 成功。
+ *   fe_fault_set_handler(0, NULL)    注销；返回 0 = 注销掉了，
+ *                                    -3(FE_ERR_NOENT) = 本来就没登记。
+ *
+ * ★ 谁登记谁收 ★ 收件线程 = **调用这条 syscall 的线程**。这是故意的：
+ * 出错线程**不能**是收件线程（它自己卡在异常上下文里等回复，没人能替它回），
+ * 所以要有一个处理者路径的程序至少要有**两条**线程——一条登记并 `recv`，
+ * 另一条干活。单线程程序用不了处理者，代价落在用户态（多一条线程 + 它的栈）。
+ *
+ * ★ `regs` 必须已映射且**可写** ★ 登记时内核当场校验（未映射返回
+ * -7(FE_ERR_FAULT)），因为投递跑在异常上下文里，那时发现写不进去只能杀线程。
+ * 推荐做法：`mmap` 一页专门放它，并在**登记之前**把它碰一次（按需分页）。 */
+long fe_fault_set_handler(long ep_handle, struct fe_fault_regs *regs);
+
+/* ★ 处理者的决定 ★ `verdict` 见 FE_FAULT_*；`regs` 是**收到的那一份**，
+ * 两个只读字段必须原样带回（改了就返回 -1 且内核什么都不做）。
+ *
+ *   返回 0        = 决定已被采纳
+ *   返回 -1       = 没对上（错的回报线程 / 错的 thread_id / 错的 fault_count /
+ *                   非法 verdict / 没有正在等的投递）
+ *   返回 -3       = 这个任务**没有登记过处理者**（例如刚 `exec` 过——
+ *                   换映像会清掉登记，见 docs/18 §6.1.5）
+ *
+ * ★ 只有 RESUME 会让出错线程继续跑 ★ KILL / RETHROW 都不会。 */
+long fe_fault_reply(u64 verdict, struct fe_fault_regs *regs);
 
 /* 终止一个任务（K2）。成功返回 FE_OK。
  *

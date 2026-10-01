@@ -798,6 +798,38 @@ static struct unit g_units[] = {
       .args = { "--chain", NULL },
       .require = { "/dev/fs0", NULL } },
 
+    /* 用户态异常处理者（K5）的**真实路径**验证：ring 3 真异常 → 投递 →
+     * 处理者 recv → FAULT_REPLY → 出错线程从处理者指定的新 rip 继续跑。
+     *
+     * ★ 为什么是**六个**单元 ★ 与 exectest 同一条理由：一个进程只能有一个
+     * 退出码，而这六种模式的成功判据各不相同——
+     *   --segv       越界写被接管，进程**没死**（退出码 0）
+     *   --ud         非法指令被跳过，进程没死（0）
+     *   --de         除零被接管且处理者填的商真的被用上（0）
+     *   --all        上面三次由**同一个**处理者接管（0，模式 E）
+     *   --nohandler  **反向对照**：没登记处理者 → 必须**仍然被杀**（-1）
+     *   --recursive  处理者自己出错 → 那条线程被杀（0x77，客户端核对的确定值）
+     * 把这些压进一个单元，"-1 与 0 同时成立"在物理上不可能。
+     * ★ `--nohandler` 的期望 -1 与 drvdeny 的期望完全一致 ★——这一条是
+     * 整个 K5 最重要的反向对照：没有它，"投递机制生效"与"内核干脆不杀了"
+     * 分不开（docs/18 §5.2 模式 D）。
+     *
+     * ★ 六个单元都**没有 needs** ★ 它不用块设备、不用中断线、不用文件系统
+     * （现场缓冲区就是一个 .bss 全局），所以 QEMU 与 VirtualBox 两个环境
+     * 都必须真的跑。按 needs 跳过它等于把"投递路径只有编译级保证"这个
+     * 空白又留回去（docs/18 §5.4）。 */
+    { .name = "faulttest", .path = "/bin/faulttest", .expect = 0, .check = 1 },
+    { .name = "faulttest-ud", .path = "/bin/faulttest", .expect = 0, .check = 1,
+      .args = { "--ud", NULL } },
+    { .name = "faulttest-de", .path = "/bin/faulttest", .expect = 0, .check = 1,
+      .args = { "--de", NULL } },
+    { .name = "faulttest-all", .path = "/bin/faulttest", .expect = 0, .check = 1,
+      .args = { "--all", NULL } },
+    { .name = "faulttest-noh", .path = "/bin/faulttest", .expect = -1, .check = 1,
+      .args = { "--nohandler", NULL } },
+    { .name = "faulttest-rec", .path = "/bin/faulttest", .expect = 0x77, .check = 1,
+      .args = { "--recursive", NULL } },
+
     /* --- 常驻服务 --- */
     { .name = "blkd",  .path = "/sbin/blkd",  .provides = "/dev/blk0", .daemon = 1,
       /* 参数在启动前由 busmaster_probe 回填（端口是**运行时发现**出来的）：

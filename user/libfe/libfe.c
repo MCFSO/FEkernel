@@ -308,6 +308,21 @@ long fe_exec(const char *path, char *const argv[], u32 argc)
     return fe_syscall(FE_SYS_EXEC, (long)path, (long)argv, (long)argc, 0, 0, 0);
 }
 
+/* ★ 异常处理者登记 / 注销（K5）★ `ep_handle == 0` 就是注销，返回值回答
+ * "本来有没有"（0 = 有、-3 = 没有）。所以它同时是"我还有处理者吗"的查询。
+ * 语义与代价见 fe_user.h 上那段注释。 */
+long fe_fault_set_handler(long ep_handle, struct fe_fault_regs *regs)
+{
+    return fe_syscall(FE_SYS_FAULT_HANDLER, ep_handle, (long)regs, 0, 0, 0, 0);
+}
+
+/* ★ 处理者的决定（K5）★ `regs` 里两个只读字段（thread_id / fault_count）
+ * 必须原样带回，否则返回 -1 且内核什么都不做。 */
+long fe_fault_reply(u64 verdict, struct fe_fault_regs *regs)
+{
+    return fe_syscall(FE_SYS_FAULT_REPLY, (long)verdict, (long)regs, 0, 0, 0, 0);
+}
+
 long fe_wait(long task_handle, int *out_status)
 {
     return fe_syscall(FE_SYS_PROCESS_WAIT, task_handle, (long)out_status, 0, 0, 0, 0);
