@@ -736,9 +736,16 @@ fe_status_t fe_wait_any(struct fe_task *t, const struct fe_wait_target *targets,
  * 第二条靠遍历**该任务句柄表里的端点**来定位：正在收消息的线程必然持有
  * 那个端点的句柄，所以"谁在等"可以从句柄表这一侧回答，不需要给端点加链。
  *
- * ★ 将来若有第三种等待登记，必须同时加一条取消路径 ★
- * 漏加的症状不是崩溃，而是"那个线程杀不掉"——它会一直阻塞下去，
- * 于是任务永远不消失。这一条写在 docs/13-tasks-and-kill.md §3.5 的边界里。 */
+ * ★ 上面那两句在 D1 落地时被实测推翻了：还有第三条——通知的 waiter 单槽 ★
+ * 同一个句柄表扫描就能覆盖它（正在等这个通知的线程必然持有它的句柄，
+ * 与端点那条**完全对称**），所以两条路径变成三条、扫描只有一趟。
+ * 留这段是因为"漏加一条取消路径"的症状值得记住：**那个线程杀不掉**，
+ * 它会一直阻塞下去，于是任务永远不消失；而更隐蔽的是**不崩**——
+ * 线程带着 CANCELED 走到闸门、死、僵尸被回收，可对象里的槽还指着它，
+ * 下次 signal 就把已释放的内存当线程去唤醒（use-after-free）。
+ *
+ * ★ 将来若有第四种等待登记，必须同时加一条取消路径 ★
+ * 这一条写在 docs/13-tasks-and-kill.md §3.5 的边界里。 */
 void fe_thread_cancel(struct fe_task *task, struct fe_thread *victim)
 {
     if (!task || !victim) {
@@ -751,7 +758,7 @@ void fe_thread_cancel(struct fe_task *task, struct fe_thread *victim)
         struct fe_wait_node *node = (struct fe_wait_node *)victim->wait_node;
         wait_unregister(task, victim, node, node->n);
     }
-    /* 路径 2：端点接收槽。★ 必须在关中断区间里做 ★
+    /* 路径 2 / 3：端点接收槽与通知等待槽。★ 必须在关中断区间里做 ★
      * 否则"找到它、清掉它"之间对方可能刚好收到消息并被唤醒，
      * 于是我们清掉的是一个已经不在等的线程的登记（无害），
      * 或者更糟：漏清一个仍然在等的登记（有害）。 */
@@ -761,10 +768,29 @@ void fe_thread_cancel(struct fe_task *task, struct fe_thread *victim)
         if (fe_failed(fe_handle_lookup(&task->handles, h, 0, &obj))) {
             continue;
         }
-        if (obj && obj->type == FE_OBJ_ENDPOINT) {
+        if (!obj) {
+            continue;
+        }
+        if (obj->type == FE_OBJ_ENDPOINT) {
             struct fe_endpoint *ep = FE_OBJ_OF(obj, struct fe_endpoint);
             if (ep->receiver == victim) {
                 ep->receiver = NULL;
+            }
+        } else if (obj->type == FE_OBJ_NOTIFICATION) {
+            /* ★ D1：通知的单槽等待登记（`fe_notification_wait` 的兼容路径）★
+             *
+             * 不摘它的后果分两步显形，而且第二步才是真正危险的那一步：
+             *   1. 受害者返回 CANCELED → 经过闸门 → 死 → 僵尸被回收
+             *      （`reap_ok=true`，见 user.c:543-545）；
+             *   2. 槽里那根指针**还指着已经释放的内存**，下次
+             *      `fe_notification_signal_obj` 命中掩码时会拿它去
+             *      `fe_sched_wake`（读 `t->state`）——use-after-free。
+             * `wait_mask` 一起清：留着它等于给"下一次 signal"留一份
+             * 与被取消的等待者有关的陈旧条件。 */
+            struct fe_notification *nt = FE_OBJ_OF(obj, struct fe_notification);
+            if (nt->waiter == victim) {
+                nt->waiter = NULL;
+                nt->wait_mask = 0;
             }
         }
     }
