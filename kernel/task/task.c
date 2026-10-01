@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: 0BSD */
 #include <fe/task.h>
 #include <fe/ipc.h>
+#include <fe/process.h>         /* K5：fe_fault_release_handler（端点引用） */
 #include <fe/sched/thread.h>
 #include <fe/mm/kheap.h>
 #include <fe/kprintf.h>
@@ -57,6 +58,18 @@ void fe_object_destroy(struct fe_object_header *hdr)
          * 必须在下面 `fe_kfree(t)` **之前**做。 */
         fe_task_detach_threads(t);
         fe_handle_table_clear(&t->handles);
+        /* ★ K5：放掉处理者端点的那次引用（docs/18 §2.1 代价 3）★
+         *
+         * 登记时内核**自己**对端点加过一次引用（用户态关掉句柄之后登记
+         * 仍然有效就靠它）。漏掉这一次 unref 的症状是"端点对象永不销毁"
+         * ——而它挂着消息队列与等待者表；多加一次就是"用户关掉句柄之后
+         * 端点还在"。两种都不报错，只是慢漏或不漏，所以它必须在这条
+         * **唯一**的任务销毁路径上。
+         *
+         * 位置：在 `fe_kfree(t)` 之前（下面），也必须在句柄表清空之后——
+         * 句柄表那一份引用已经随着 `fe_handle_table_clear` 放掉了，
+         * 剩下的就是登记这一次。 */
+        fe_fault_release_handler(t);
         /* 归还硬件资源。顺序要紧：先掐中断线，再还资源池，最后放位图槽位。
          * 反过来的话，中断可能还在往一个正在销毁的对象里投递。 */
         fe_irq_release_owner(t->id);

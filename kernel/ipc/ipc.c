@@ -280,6 +280,37 @@ void fe_endpoint_destroy(struct fe_endpoint *ep)
     }
 }
 
+/* ★ 丢弃端点队列里的全部积压消息（K5 自检用）★
+ *
+ * ★ 为什么不给自检直接看 `ep->head` 就够 ★
+ * 自检要判"这次投递到底有没有进队"，最干净的判据是"投递前清空、投递后
+ * 恰好一条"。而释放消息要 `message_free`，它是本文件的 static ——
+ * 所以把"清空"这件事放在**能拿到它**的这一侧，而不是让自检去数差值
+ * （数差值在有残留时要写成 `before + 1`，可读性差且容易写错）。
+ *
+ * 它只丢消息、不动端点的任何其它状态（等待者、计数、引用）。
+ * 生产路径上**没有调用者**，是给自检用的。 */
+u32 fe_endpoint_drain(struct fe_endpoint *ep)
+{
+    if (!ep) {
+        return 0;
+    }
+    u32 n = 0;
+    u64 irq = fe_irq_save();
+    struct fe_message *m = ep->head;
+    ep->head = NULL;
+    ep->tail = NULL;
+    ep->count = 0;
+    fe_irq_restore(irq);
+    while (m) {
+        struct fe_message *next = m->next;
+        message_free(m);
+        m = next;
+        n++;
+    }
+    return n;
+}
+
 fe_status_t fe_endpoint_send(struct fe_task *t, fe_handle_t ep_h,
                              const struct fe_msg_header *hdr,
                              const void *payload, const fe_handle_t *handles)
@@ -296,9 +327,30 @@ fe_status_t fe_endpoint_send(struct fe_task *t, fe_handle_t ep_h,
         return FE_ERR_INVAL;
     }
     struct fe_endpoint *ep = FE_OBJ_OF(obj, struct fe_endpoint);
+    return fe_endpoint_send_obj(t, ep, hdr, payload, handles);
+}
 
+/* ★ 直接按**对象**发送（K5 用）★
+ *
+ * ★ 为什么 K5 不能走句柄那条路 ★
+ * `fe_endpoint_send` 要 `fe_handle_lookup(..., FE_RIGHT_SEND, ...)`——
+ * 于是"处理者能不能收到异常"就变成了"那个句柄此刻有什么权限位"，
+ * 而权限位是用户态可以自己收窄的（`HANDLE_DUP` 收窄、`HANDLE_CLOSE` 关掉）。
+ * **内核的异常投递不该依赖用户态当前的权限位**：登记那一刻内核已经把
+ * "往这里投"这件事记下来了，并对端点加了一次引用；投递时用的是那次登记的
+ * 结果，而不是重新去问句柄表。
+ *
+ * 主体与 `fe_endpoint_send` 共用（下面这一段是唯一的入队实现）：
+ * 校验 → 建消息 → 队列满则 AGAIN → 入队 → 唤醒接收者与多对象等待者。 */
+fe_status_t fe_endpoint_send_obj(struct fe_task *t, struct fe_endpoint *ep,
+                                 const struct fe_msg_header *hdr,
+                                 const void *payload, const fe_handle_t *handles)
+{
+    if (!t || !hdr || !ep) {
+        return FE_ERR_INVAL;
+    }
     struct fe_message *m = NULL;
-    s = build_message(t, &m, hdr, payload, handles, NULL);
+    fe_status_t s = build_message(t, &m, hdr, payload, handles, NULL);
     if (fe_failed(s)) {
         return s;
     }

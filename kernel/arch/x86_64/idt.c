@@ -7,6 +7,7 @@
 #include <fe/string.h>
 #include <fe/sched/thread.h>
 #include <fe/task.h>            /* 缺页解析需要当前任务与它的区间表 */
+#include <fe/process.h>         /* K5：fe_fault_deliver 与 FE_FAULT_* */
 #include <fe/user.h>
 #include <fe/mm/vma.h>
 
@@ -222,6 +223,7 @@ static u64 g_last_user_fault_vector = ~0ull;
 static u64 g_user_fault_count;
 static u64 g_user_fault_by_vec[32]; /* 按向量分别计数（见 fe_user_fault_count_of） */
 static u64 g_pf_resolved;           /* 被按需分页消化掉的缺页次数（诊断） */
+static u64 g_fault_handled;         /* 被用户态处理者消化掉的次数（K5） */
 
 u64 fe_last_user_fault_vector(void)
 {
@@ -254,8 +256,39 @@ u64 fe_pf_resolved_count(void)
     return g_pf_resolved;
 }
 
+/* ★ 被处理者**消化掉**的用户态异常次数（K5）★
+ *
+ * ★ 为什么它必须与 `fe_user_fault_count` 分开（docs/18 §6.1.1）★
+ * K5 之前"用户态异常次数"只有一个含义。K5 之后被处理者接管的那些异常
+ * 在出口③就 `return` 了，**走不到**出口④的那两个计数器——于是
+ * `fe_user_fault_count()` 的含义悄悄变成了"**没被消化**的用户态异常次数"。
+ *
+ * 它的唯一消费者是 `fe_selftest_user`（判"drvdeny 那次 #GP 被看见了"），
+ * 而那个判据依赖的是"全部"。**"看起来还通过"正是最坏的一种绿**：
+ * 判据依赖的语义已经变了，但它仍然通过，因为恰好没有受害者
+ * （drvdeny 不登记处理者）。
+ *
+ * 所以处置是：把旧接口的含义**明确定义成"全部"**（出口③也记一次），
+ * 再**新增**这一个"被消化的"计数，而不是把旧接口改成"未消化"。 */
+u64 fe_user_fault_handled_count(void)
+{
+    return g_fault_handled;
+}
+
 /* 注意：**不是** FE_NORETURN —— 缺页可能被按需分页消化掉，
- * 那时它正常返回，异常路径会 iretq 回原现场继续跑。 */
+ * 那时它正常返回，异常路径会 iretq 回原现场继续跑。
+ *
+ * ★ K5 之后这里有**四条**出口（docs/18-user-fault-handler.md §2.0）★
+ *   ① 闸门判据成立 → 杀（**排在最前**，§2.7）
+ *   ② 按需分页消化 → return（今天的路径，一个字没动）
+ *   ③ 投递给处理者并回了 RESUME → 回填现场并 return
+ *   ④ 其余一切 → 杀
+ *
+ * ★ 出口从两条变成四条是这一整套改动里**结构上最贵**的一处 ★
+ * 因为它是异常分发里唯一一个多分支的地方，而这个文件里已经有过一次
+ * 实测事故：§下方 `fe_isr_dispatch` 那段注释记着"漏一个 `return` 就把
+ * 一次成功的缺页解析当成致命错误 → panic"。所以：**每一条 return 都要有
+ * 一条自检堵它**（F2 堵 ①、F3 堵 ②、F1 堵 ③、F4/F5/F8 堵 ④）。 */
 static void user_fault(struct fe_regs *r)
 {
     const char *tname = "?";
@@ -263,11 +296,52 @@ static void user_fault(struct fe_regs *r)
     if (t) {
         tname = t->name;
     }
-    u64 cr2 = fe_read_cr2();
+    /* ★ CR2 只有 #PF(14) 才会被 CPU 写 ★
+     *
+     * `fe_fault_regs.cr2` 的 ABI 是"出错线性地址；**只有 #PF 有意义，
+     * 其余为 0**"（kernel/include/fe/regs.h 与 user/include/fe_user.h
+     * 两边都这么写）。原先这里无条件读 CR2，于是 #UD/#DE 报给处理者的
+     * 是**上一次缺页留下的地址**——一个陈旧值。
+     *
+     * ★ 这条不是推理出来的，是实测出来的 ★ `user/bin/faulttest` 的
+     * `--ud`/`--de` 两个模式把 cr2 打出来，第一次跑就是
+     * `cr2=0x0000000051000000`（正是同一个进程里 --segv 那个越界地址）。
+     * 危害在于它**误导处理者**：处理者按 ABI 用"cr2 是否为 0"区分
+     * "这是不是缺页"，而它拿到的是别人的地址。
+     *
+     * 所以这里按向量取值：只有 #PF 读 CR2，其余一律给 0。 */
+    u64 cr2 = (r->vector == 14u) ? fe_read_cr2() : 0;
 
-    /* ★ 缺页的第一条出路：按需分页 / 栈增长 ★
+    /* ★★ 出口①：闸门判据在**最前面**（§2.7）★★
+     *
+     * 一个正在被终止的线程没必要再补页、也没必要再问处理者——补了它也回不去：
+     * 闸门（`fe_sched_maybe_switch`）会在它下一次回用户态时把它杀掉。
+     * 先判它有两个好处：不浪费一次投递往返，也不给处理者一个"我救活了它"
+     * 的错觉。
+     *
+     * ★ 这一句的顺序需要一条负向对照来证明 ★ 见自检 F2：
+     * `task->dying` 时端点里必须**一条消息都没有**，而同一时刻另一个
+     * 没被终止的任务用同一个现场投递必须有消息。 */
+    if (t && fe_thread_should_die(t)) {
+        g_last_user_fault_vector = r->vector;
+        g_user_fault_count++;
+        if (r->vector < 32u) {
+            g_user_fault_by_vec[r->vector]++;
+        }
+        fe_thread_exit(-1);         /* 不返回 */
+    }
+
+    /* ★★ 出口②：缺页的第一条出路：按需分页 / 栈增长 ★★
      * 判定逻辑全部在 fe_user_resolve_fault 里（它与 VMA 表在一起，
-     * 因为"这块地址该不该有映射"是区间表的问题，不是异常处理器的问题）。 */
+     * 因为"这块地址该不该有映射"是区间表的问题，不是异常处理器的问题）。
+     *
+     * ★ 为什么它必须排在投递**前面**（§2.5.1）★
+     * 栈增长是内核的合法职责：先问处理者的话，**每一个** C 程序在栈长出
+     * 预映射的那几页之后都要自己接管缺页，否则就是崩溃——那不是"更灵活"，
+     * 是把内核该做的事推给每个程序。而且用户态**补不了页**：项目里没有
+     * "按 VMA 的权限给我一页"这个原语（MEM_MAP 映射的是对象已有的帧）。
+     * 两个判据不重叠（`fe_user_resolve_fault` 只承认三种情况，其余一律
+     * false），所以"按需分页在前"不会吃掉处理者该看见的异常。 */
     if (r->vector == 14) {
         struct fe_task *task = fe_task_current();
         if (fe_user_resolve_fault(task, cr2, r->error)) {
@@ -276,6 +350,36 @@ static void user_fault(struct fe_regs *r)
         }
     }
 
+    /* ★★ 出口③：问处理者（K5 新加的第三个选项）★★
+     *
+     * ★ 判据 `(r->cs & 3) == 3` 在调用点已经成立 ★
+     * `fe_isr_dispatch` 只在"来自 ring 3 且 vector < 32"时才调到这里，
+     * 所以这一段天然拿不到内核态的异常。**这一条是安全边界，不是可以
+     * 顺手放宽的地方**：内核态异常的现场里 `cs` 是 ring 0，处理者改
+     * `rip`/`rsp` 之后 iretq 就是任意内核代码执行——不需要"能改 cs"，
+     * 把 `cs` 原样弹回去就够了（docs/18 §3.1）。 */
+    {
+        struct fe_fault_regs fres;
+        memset(&fres, 0, sizeof(fres));
+        if (fe_ok(fe_fault_deliver(t, r, cr2, &fres))) {
+            if (fe_fault_apply_regs(r, &fres)) {
+                /* ★ 记账：这两个计数器记的是"**全部**用户态异常"★
+                 * 出口③也要记一笔，否则它们的语义会悄悄从"全部"变成
+                 * "没被消化的"——而它们唯一的消费者依赖"全部"
+                 * （docs/18 §6.1.1）。被消化的那部分另有一个计数。 */
+                g_last_user_fault_vector = r->vector;
+                g_user_fault_count++;
+                if (r->vector < 32u) {
+                    g_user_fault_by_vec[r->vector]++;
+                }
+                g_fault_handled++;
+                return;
+            }
+            /* 现场非法（改了 cs/ss）：`fault_apply_regs` 已经点过名，照旧杀。 */
+        }
+    }
+
+    /* ★★ 出口④：照旧杀（今天的行为，一个字没改）★★ */
     g_last_user_fault_vector = r->vector;
     g_user_fault_count++;
     if (r->vector < 32u) {

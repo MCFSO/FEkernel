@@ -692,6 +692,10 @@ FE_NORETURN void fe_kmain(void)
     f = fe_selftest_exec();      g_selftest_failures += f;
     fe_kprintf("        => 替换映像失败项: %u\n", f);
     fe_kprintf("\n");
+    fe_kprintf("[自检] 用户态异常处理者（K5：投递判据 / 回复校验）:\n");
+    f = fe_selftest_fault();     g_selftest_failures += f;
+    fe_kprintf("        => 异常处理者失败项: %u\n", f);
+    fe_kprintf("\n");
     fe_kprintf("[自检] FPU / SIMD（M10 前置）:\n");
     f = fe_selftest_fpu();       g_selftest_failures += f;
     fe_kprintf("        => FPU 失败项: %u（模式：%s）\n", f,

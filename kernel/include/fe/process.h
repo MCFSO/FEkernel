@@ -25,12 +25,14 @@
 #include <fe/status.h>
 #include <fe/syscall.h>
 #include <fe/task.h>            /* FE_TASK_NAME_MAX：候选现场要带新映像的名字 */
+#include <fe/regs.h>            /* FE_FAULT_* 常量与 struct fe_fault_regs */
 
 struct fe_task;
 struct fe_thread;
 struct fe_inode;
 struct fe_address_space;
 struct fe_vma_table;
+struct fe_endpoint;
 
 /* argc/argv/envp 上限。取小值是有意的：内核要为它们准备定长缓冲，
  * 而真正的服务不需要几百个参数。超限返回 FE_ERR_RANGE 而不是截断——
@@ -228,5 +230,109 @@ u32 fe_selftest_kill(void);
 /* 替换映像（K6）的自检：E1–E5（叫停其它线程 / 调用者未受伤 / 死透后不再占
  * CPU / 三条取消点 / 任务级终止仍一次全杀）。返回失败项数。 */
 u32 fe_selftest_exec(void);
+
+/* ---- 用户态异常处理者（K5，docs/18-user-fault-handler.md）----
+ *
+ * 形状：`#PF/#GP/#UD/#DE/#BP` 来自 ring 3 → **先试按需分页**（今天的路径，
+ * 一个字没动）→ 失败：这个任务登记了处理者吗？
+ *   没有 → `fe_thread_exit(-1)`（今天的行为，一个字不改）
+ *   有   → 把现场拷成 `fe_fault_regs`、用端点消息投给处理者，
+ *          然后**在异常上下文里就地让出**、等处理者的回复
+ * → 回复"已处理"：把用户改过的现场装回 `r`，`return`（异常路径 iretq 回去）
+ *   回复"照旧杀"：`fe_thread_exit(-1)`
+ *   没有回复 / 投递失败 / 嵌套超限：`fe_thread_exit(-1)`
+ *
+ * ★ 为什么投递之后是"就地让出 + 有界轮询"，而不是阻塞 ★
+ * `user_fault` 全程跑在 **IF=0** 里（所有 IDT 项都是中断门、`isr_common`
+ * 只有 `cld` 没有 `sti`），而"过一会儿超时"依赖节拍中断——IF=0 里节拍不跳。
+ * 阻塞则要求"谁能唤醒它"，那会**新增第六处等待登记**与一条新的取消路径
+ * （`docs/13-tasks-and-kill.md` §6.3 那张表的教训）。让出是软中断转发，
+ * **不受 IF 影响**，而且它自己会回来看——有界，且漏不掉登记。
+ *
+ * ★ 内核态的异常**永远不投递** ★ 那是提权链（现场里 `cs` 是 ring 0，
+ * 处理者改 `rip`/`rsp` 之后 iretq 就是任意内核代码执行——不需要"能改 cs"，
+ * 只要把 `cs` 原样弹回去就够了）。判据是调用点的 `(r->cs & 3) == 3`。
+ * 这一条与"拒绝处理者改 `cs`/`ss`"是**同一个洞的两个入口**，两条都必须有。 */
+
+/* 登记 / 注销。`ep` 为 NULL 表示注销。
+ * `buf` 是用户缓冲区（处理者收现场的地址），注销时忽略。
+ * 登记时内核**自己**对端点加一次引用（见 task.h 里 handler_ep 的说明）。 */
+fe_status_t fe_fault_set_handler(struct fe_task *t, struct fe_endpoint *ep, u64 buf);
+fe_status_t fe_fault_clear_handler(struct fe_task *t);
+
+/* ★ 任务销毁路径要调的：放掉处理者端点的那次引用 ★
+ *
+ * 与 `fe_fault_clear_handler` 的区别：这里**只释放引用**、不做别的
+ * （任务马上就不存在了）。它必须被 `task.c` 的 `case FE_OBJ_TASK` 调用——
+ * 漏掉的症状是"端点对象永不销毁"（挂着消息队列与等待者表），
+ * 而它**不报错**，只是慢漏。 */
+void fe_fault_release_handler(struct fe_task *t);
+
+/* ★ 投递后等回复的轮数上界（有界轮询）★
+ *
+ * ⚠ 这个数字**没有实测依据**，是保守的大值 ⚠
+ * 它与 `FE_EXEC_KILL_ROUNDS = 200000`（等"线程死透"）同族，但**判据不同**：
+ * 那里等的是"线程死透"，这里等的是"**另一条线程**跑完一段用户代码
+ * 并做一次系统调用回来"。docs/18 §6.1.6 第 1 条把这条列为"仍待查"：
+ * 判据是"处理者从被投递到回复要多少轮让出"，必须由**双环境实跑**给出。
+ * 在实跑量出来之前，取一个明显过大的值 —— 取大了的代价只是"处理者真的
+ * 卡死时多等一会儿"，取小了的代价是**正常的处理者被误判成死掉**。
+ * （实测上界见提交信息与 docs/18 §6.1.6 的收尾。） */
+#define FE_FAULT_WAIT_ROUNDS 200000u
+
+/* 处理者的决定。`verdict` 见 fe/syscall.h 的 FE_FAULT_*。
+ *
+ * ★ 必须校验"这是不是等我这一个回复"（三项一起对）★
+ * 按 docs/18 §2.3 的 `(task_id, thread_id, fault_seq)`：
+ *   - `task_id`   → `t` 本身，syscall 层用 `fe_task_current()` 传进来；
+ *   - `thread_id` → `replier` 必须是登记时钉住的**收件线程**（§2.3.2
+ *                   "谁登记谁收"），而 `regs->thread_id` 必须是**正在等的那条
+ *                   出错线程**。两条一起把"谁能替我回复"钉死在内核里，
+ *                   而不是靠用户态自觉；
+ *   - `fault_seq` → `regs->fault_count` 必须回显成本轮的轮次号
+ *                   （`thread_id` / `fault_count` 在 ABI 里是**只读**字段）。
+ * 对不上返回 `FE_ERR_INVAL` 并**不做任何事**。理由：一个任务里可能有两条线程
+ * 先后等回复，没有这个校验就是"A 的决定被装到 B 的现场上"——那是
+ * **跨线程现场伪装**，是安全边界问题。
+ *
+ * `regs` 为 NULL 一律拒（没有身份就没有回复）；`FE_FAULT_FLAG_KEEP_REGS`
+ * 只表示"现场值用原来的"，身份字段仍然要回显对。 */
+fe_status_t fe_fault_reply(struct fe_task *t, struct fe_thread *replier,
+                           const struct fe_fault_regs *regs, u64 verdict);
+
+/* 投递给处理者。成功 = "已处理"（调用者按 `out_regs` 回填现场并 return）。
+ *
+ * 返回 FE_OK 表示"处理者回了 RESUME"（`out_regs` 有效）；
+ * 其他任何情况（没登记 / 闸门 / 深度超限 / 同现场重复 / 自投递 /
+ * 投递失败 / 等不到回复 / 处理者说 KILL）都返回失败，调用者照旧杀线程。 */
+fe_status_t fe_fault_deliver(struct fe_thread *victim, const struct fe_regs *r,
+                             u64 cr2, struct fe_fault_regs *out_regs);
+
+/* ★ 把处理者给的现场装回中断现场 ★（`user_fault` 拿到 RESUME 之后调它）
+ *
+ * 逐字段列全（不抽样）；**拒绝改 `cs`/`ss`** ——那是提权链：
+ * `iretq` 从栈上弹的就是那个 `cs`，我们只是把它弹回去，所以"允许改 cs"
+ * 不需要任何额外条件就已经是任意内核代码执行（docs/18 §3.1）。
+ * 返回 false = 现场非法，调用者照旧杀线程。 */
+bool fe_fault_apply_regs(struct fe_regs *r, const struct fe_fault_regs *f);
+
+/* 用户态异常的总次数（**含被处理者消化的**）与被消化的次数。
+ * 见 docs/18 §6.1.1：`fe_user_fault_count()` 的语义由这两个定义清楚。 */
+u64 fe_fault_delivered_count(void);
+u64 fe_fault_resumed_count(void);
+
+/* K5 的内核自检（F1–F6、F8、F9、F10）。返回失败项数。 */
+u32 fe_selftest_fault(void);
+
+/* ---- 自检钩子（**只给自检用**，生产路径上恒为 NULL）----
+ *
+ * 自检里有几条要验"处理者不回复时会怎样"，而 `FE_FAULT_WAIT_ROUNDS` 是
+ * 20 万——几条加起来上百万次让出，会把整轮启动拖垮。这个钩子在**轮询循环
+ * 的同一位置**每轮被调一次，既能观察"此刻的回复槽/端点是空的"，
+ * 也能替自检当场回一个决定（回完之后循环下一轮就看见 `arrived` 正常退出）。
+ * 所以自检验的仍然是**真的那个循环**，没有绕过任何判据。 */
+void fe_fault_set_wait_hook(void (*fn)(struct fe_thread *, void *), void *ctx);
+/* 最近一次投递实际等了几个让出轮（诊断；勾住"有界轮询"是否真的在轮）。 */
+u64 fe_fault_last_wait_rounds(void);
 
 #endif /* FE_PROCESS_H */

@@ -59,6 +59,21 @@ u32 fe_selftest_user(void)
                    (unsigned long long)gp,
                    (unsigned long long)fe_user_fault_count(),
                    (unsigned long long)fe_user_fault_count_of(14));
+        /* ★ K5 之后这里多一个数：被用户态处理者**消化掉**的那部分 ★
+         * 上面那两个数的语义是"**全部**用户态异常"（docs/18 §6.1.1 第 1 条：
+         * 旧接口的含义不能悄悄改成"未消化的"，因为它的读者依赖"全部"）；
+         * "消化的"另立一个计数。打出来是为了让它有**真实的消费者**——
+         * 一个没有任何调用者的访存器会被 --gc-sections 丢掉，
+         * 于是"接口存在"这句话就只剩源码里的一行声明。
+         *
+         * 今天它必然等于 `user/bin/faulttest` 接管掉的次数之和
+         * （--segv 1 + --ud 1 + --de 1 + --all 3 = 6；--nohandler 与
+         * --recursive 那两条路本来就不该被消化，各 0）。
+         * ★ 第一版这里写的是"必然是 0"，实测是 6 ★ —— 一句想当然的注释，
+         * 而它恰好被这个数照出来了：留着它比删掉它有用。 */
+        fe_kprintf("        其中被用户态处理者消化的 %llu 次"
+                   "（K5；应当 == faulttest 各模式接管次数之和 1+1+1+3 = 6）\n",
+                   (unsigned long long)fe_user_fault_handled_count());
     }
     return fail;
 }

@@ -15,6 +15,7 @@
 
 struct fe_address_space;
 struct fe_thread;
+struct fe_endpoint;
 
 struct fe_task {
     struct fe_object_header hdr;
@@ -76,6 +77,42 @@ struct fe_task {
     bool dying;
     /* 已经因为"任务正在被终止"而被唤醒/标记过的线程数（诊断）。 */
     u32 killed_threads;
+
+    /* ★ 用户态异常处理者（K5，docs/18-user-fault-handler.md）★
+     *
+     * 登记在**任务**上（不是线程）：端点是句柄、句柄表是任务的；
+     * 运行库的形态就是"一个进程一个崩溃处理器"（C++ 的 std::terminate、
+     * JIT 的 SIGSEGV 兜底都是进程级的）；每线程一个端点会把注册/注销变成
+     * N 份，而 `FE_HANDLE_TABLE_SIZE` 是 256。
+     *
+     * ★ `handler_ep` 是**对象指针**，内核自己对它加过一次引用 ★
+     * 用户态可以 `HANDLE_CLOSE` 掉那个句柄，但内核的登记里还存着指针——
+     * 所以登记时 `fe_object_ref`，任务销毁路径上（task.c 的
+     * `case FE_OBJ_TASK`）必须 `fe_object_unref`。
+     * 漏掉这一次 unref = 端点对象永不销毁（它挂着消息队列与等待者表）；
+     * 多加一次 = 用户关掉句柄之后端点还在。两种都不报错，只是慢漏或不漏。
+     *
+     * ★ 为什么是对象指针而不是句柄号 ★
+     * 用句柄号就要在投递时走 `fe_handle_lookup`，而它要求 `FE_RIGHT_SEND`
+     * ——于是"处理者能不能收到异常"变成了"那个句柄此刻有什么权限位"，
+     * 而权限位是用户态可以自己收窄的。**内核的异常投递不该依赖用户态当前的权限位。** */
+    struct fe_endpoint *handler_ep;     /* NULL = 没登记 */
+    u64 handler_buf;                    /* 用户现场缓冲区（虚拟地址，属**映像**）*/
+    /* ★ 收件线程：登记时的调用线程 ★ "谁登记谁收"
+     * 理由：端点的接收权不受线程限制，但"我登记的时候打算让谁收"只有调用者
+     * 自己知道。钉成主线程会在"工作线程登记、主线程收"这种布局下强迫用户改代码。
+     * ★ 它拦的是一种实现时一定会漏的情形 ★ "单线程程序自己给自己登记"——
+     * 出错线程卡在 user_fault 里等回复，而唯一能回复的线程正是它自己：
+     * 结果是等满轮数才死（"登记了处理者但每次异常都要等很久"），比崩溃难查。
+     * 这条判据与 `fault_depth` **不重复**：那时深度还是 0，深度判据放行。 */
+    struct fe_thread *handler_recv_thread;
+    /* ★ 投递深度（0 或 1）+ 谁在等 ★ 为什么在任务上：两条线程各持一个
+     * 0/1 的线程级计数就能同时各投递一次，"深度 1"退化成了"深度 N"。
+     * 但它必须有主：回复槽是**每线程**的，加一的那一处要同时说清"谁的槽在等"。 */
+    u32  fault_depth;
+    struct fe_thread *fault_owner;      /* fault_depth != 0 时：正在等回复的线程 */
+    u64  fault_seq;                     /* 投递序号：回复必须对上它 */
+    u64  fault_count_total;             /* 本任务累计投递次数（诊断） */
 
     char name[FE_TASK_NAME_MAX];
 };

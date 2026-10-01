@@ -355,6 +355,39 @@ enum fe_syscall_num {
     FE_SYS_MAX              = 0x92,
 };
 
+/* ---- 用户态异常处理者（K5）的共享 ABI ----
+ * 设计与逐条语义见 docs/18-user-fault-handler.md。
+ *
+ * ★ 投递走消息、回复走系统调用（两条路各有职责）★
+ * "现场怎么给用户态"是**拷贝**（内核侧 `fe_copy_to_user` 拷进用户在登记时
+ * 给出的缓冲区），而"处理者现在被叫醒"必须走已有的端点唤醒机制——
+ * 所以事件用一条消息、载荷是现场缓冲区的地址。
+ *
+ * ★ 回复**不走消息** ★ 内核在异常上下文里等的是一个**决定**，不是数据流；
+ * 而 `fe_msg_reply` 要求处理者先 `recv` 拿到 `reply_ep`，那是"同步 RPC"的
+ * 形状（内核并不在 recv 里等）。更硬的一条：系统调用天然携带"谁在回复"
+ * （`fe_task_current()`），而消息的 `reply_ep` **可以转交**——
+ * "谁能替我回复"必须不可伪造，否则另一个任务可以替处理者做决定。 */
+
+#define FE_FAULT_PROTO      0x4641554Cu   /* 'FAUL' —— 消息头的 proto 字段 */
+#define FE_FAULT_OP_EVENT   1u            /* 内核 → 处理者：出事了（载荷 = 现场）*/
+/* ★ 这里**没有** FE_FAULT_OP_REPLY ★ 回复不走消息（理由见上），
+ * 一个不存在的常量不值得留一行。 */
+
+#define FE_FAULT_REGS_SIZE  200u          /* sizeof(struct fe_fault_regs)，内核侧 */
+#define FE_FAULT_REGS_SIZE_X 200u         /* 同一数值的用户态镜像（两边各写一次，
+                                           * 各自 _Static_assert 钉住——见
+                                           * fe_clock_info 那次"宏与结构体对不上"
+                                           * 的实测事故，docs/13 §2） */
+
+/* 处理者的决定（`FE_SYS_FAULT_REPLY` 的第一个参数）。
+ * 低 4 位是动作，高位是标志。 */
+#define FE_FAULT_ACTION_MASK   0xFu
+#define FE_FAULT_RESUME        1u    /* 已处理：按我给的现场继续跑 */
+#define FE_FAULT_KILL          2u    /* 我不管：照旧杀线程（今天的行为） */
+#define FE_FAULT_RETHROW       3u    /* 再抛一次：让本线程再走一轮投递 */
+#define FE_FAULT_FLAG_KEEP_REGS 0x10u /* 与 RESUME 同用：现场用原来的，不改 */
+
 /* 资源类别，供 RESOURCE_LOCK/UNLOCK 与诊断使用。
  * 数值与 fe/resource.h 的 enum fe_res_kind 一致。 */
 #define FE_RES_IOPORT 1u

@@ -105,6 +105,24 @@ fe_status_t fe_endpoint_send(struct fe_task *t, fe_handle_t ep,
                              const struct fe_msg_header *hdr,
                              const void *payload, const fe_handle_t *handles);
 
+/* ★ 直接按**对象**发送（K5 的异常投递用）★
+ *
+ * 与上面那条的唯一区别是"不查句柄表、不要求 FE_RIGHT_SEND"。理由：
+ * 内核的异常投递**不该依赖用户态当前的权限位**——登记那一刻内核已经记下
+ * "往这里投"并对端点加了一次引用，投递时用那次登记的结果就够了；
+ * 走句柄那条路的话，用户态 `HANDLE_DUP` 收窄权限或 `HANDLE_CLOSE` 关掉句柄
+ * 都会让"处理者能不能收到异常"变成另一个问题的答案。
+ *
+ * `ep` 由调用者保证有效（持有引用的对象指针）。入队主体与
+ * `fe_endpoint_send` 共用同一段实现。 */
+fe_status_t fe_endpoint_send_obj(struct fe_task *t, struct fe_endpoint *ep,
+                                 const struct fe_msg_header *hdr,
+                                 const void *payload, const fe_handle_t *handles);
+
+/* 丢弃端点队列里的全部积压消息，返回丢了几条（**给自检用**：
+ * 生产路径上没有调用者）。理由见 ipc.c 里实现的说明。 */
+u32 fe_endpoint_drain(struct fe_endpoint *ep);
+
 /* 接收：无消息则阻塞当前线程直到有消息。
  * out_reply_ep 返回「回复能力」句柄（发送方带回复端点时有效），
  * out_transferred 返回随消息传递过来的句柄（长度 FE_MSG_MAX_HANDLES，无效项为 0）。 */
