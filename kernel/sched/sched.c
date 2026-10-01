@@ -570,6 +570,11 @@ u64 fe_sched_maybe_switch(u64 rsp)
     next->slice = (i32)g_default_slice;
     next->switches++;
     g_current = next;
+    /* [wd] 记录最近一次切换返回的 rsp（看门狗 dump 用）。 */
+    {
+        extern u64 g_dbg_last_switch_rsp;
+        g_dbg_last_switch_rsp = next->rsp;
+    }
     return next->rsp;
 }
 
@@ -723,10 +728,90 @@ void fe_sched_wake(struct fe_thread *t)
 /* 节拍处理                                                            */
 /* ------------------------------------------------------------------ */
 
+/* ★ 看门狗（临时诊断："main 让出之后再也不回来"）★
+ *
+ * 它要回答的**第一个**问题不是"谁挡住了 main"，而是**"节拍还在不在"**：
+ * 如果连"看门狗活着"那一行都不打，那就说明节拍停了——我们卡在一个
+ * 关中断的自旋里，而不是"调度器选了别人"。这两种情况的凶手完全不同，
+ * 而此前所有证据都没区分它们。
+ *
+ * 触发条件是**事实**而不是猜测：`main` 的 state 是 READY（在册）却连续
+ * 8 个节拍没被选中。触发时 dump 三样：① main 到底在不在就绪队列里
+ * （逐个走链**比指针**）；② 队列全貌；③ g_current 的 name/id/state/rsp，
+ * 以及切换路径最近一次返回的 rsp。允许重复触发，最多 5 次就闭嘴。 */
+static struct fe_thread *g_wd_main;
+static u32 g_wd_ticks;
+static u32 g_wd_quiet;
+static u32 g_wd_prints;
+u64 g_dbg_last_switch_rsp;
+
+static bool wd_in_queue(struct fe_thread *t, u32 *out_prio)
+{
+    for (u32 p = 0; p < FE_THREAD_PRIO_LEVELS; p++) {
+        for (struct fe_thread *q = g_runq[p].head; q; q = q->rq_next) {
+            if (q == t) {
+                if (out_prio) {
+                    *out_prio = p;
+                }
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static void wd_tick(void)
+{
+    g_wd_ticks++;
+    if (!g_wd_main) {
+        for (struct fe_thread *t = g_all; t; t = t->all_next) {
+            if (strcmp(t->name, "main") == 0) {
+                g_wd_main = t;
+                break;
+            }
+        }
+        fe_kprintf("[wd] 看门狗启动：main=%p\n", (void *)g_wd_main);
+    }
+    /* 前 3 个节拍打"活着"——它一次都不打，就说明节拍停了。 */
+    if (g_wd_ticks <= 3) {
+        fe_kprintf("[wd] 看门狗活着 tick=%u cur=%s main.state=%u\n", g_wd_ticks,
+                   g_current ? g_current->name : "-",
+                   g_wd_main ? g_wd_main->state : 99);
+    }
+    if (g_wd_main && g_wd_main->state == FE_THREAD_READY && g_current != g_wd_main) {
+        g_wd_quiet++;
+    } else {
+        g_wd_quiet = 0;
+    }
+    if (g_wd_quiet >= 200 && g_wd_prints < 2) {
+        g_wd_prints++;
+        u32 p = 0;
+        bool inq = wd_in_queue(g_wd_main, &p);
+        fe_kprintf("[wd] **看门狗触发**：main(id=%llu) 是 READY 却连续 %u 个节拍"
+                   "没被选中；在就绪队列里=%u(prio=%u)；g_current=%s(id=%llu "
+                   "state=%u rsp=%#llx)；切换路径上次返回 rsp=%#llx；"
+                   "看门狗活着 tick=%u\n",
+                   (unsigned long long)g_wd_main->id, g_wd_quiet, inq ? 1u : 0u, p,
+                   g_current ? g_current->name : "-",
+                   g_current ? (unsigned long long)g_current->id : 0,
+                   g_current ? g_current->state : 99,
+                   g_current ? (unsigned long long)g_current->rsp : 0,
+                   (unsigned long long)g_dbg_last_switch_rsp, g_wd_ticks);
+        for (u32 pp = 0; pp < FE_THREAD_PRIO_LEVELS; pp++) {
+            for (struct fe_thread *q = g_runq[pp].head; q; q = q->rq_next) {
+                fe_kprintf("[wd]   就绪 prio=%u %s(id=%llu state=%u switches=%llu)\n",
+                           pp, q->name, (unsigned long long)q->id, q->state,
+                           (unsigned long long)q->switches);
+            }
+        }
+    }
+}
+
 void fe_sched_tick(void)
 {
 
     wake_sleepers(fe_time_ns());
+    wd_tick();
 
     struct fe_thread *t = g_current;
     if (t && t->state == FE_THREAD_RUNNING) {
