@@ -840,6 +840,43 @@ static void wake_sleepers(u64 now_ns)
     }
 }
 
+/* ★ 把一条睡眠中的线程从睡眠链上摘下来（D3：叫醒睡眠）★
+ *
+ * ★ 为什么必须摘链，而不能只把 state 置成 READY ★
+ * 睡眠链是"谁在等时间到"的登记。状态改了而登记还在，就有两个后果：
+ *   1. `wake_sleepers` 到点后会**再**处理它一次——那时它可能已经在跑、
+ *      甚至已经死在闸门上（僵尸被回收 ⇒ 链上是悬空指针）；
+ *   2. 一个已经醒了的线程还占着链上的位置，`fe_sched_sleep_until` 的
+ *      按序插入会拿它的 `wake_ns` 当比较基准（一个不再等的时刻）。
+ * 两者的形状都是"链表里有一个不该在的节点"——正是队列卫生那一类缺陷。
+ *
+ * ★ 单向链 ⇒ 只能 O(n) 扫，但要保留成环保护 ★
+ * `fe_sched_sleep_until` 的插入路径已经有同样的扫描与 8192 步上限
+ * （链被破坏时要明确报错，而不是在这里静默挂死——挂死的现场比 panic
+ * 难查得多）。这里用同一个尺度，理由一致。
+ *
+ * ★ 找不到它是**正常**的 ★ 两种情形都会走到这儿：
+ *   - 它刚刚被 `wake_sleepers` 摘掉（时间到了、还没被调度）；
+ *   - 它已经被叫醒过一次（重复叫醒无害，见 fe_sched_wake 的语义）。
+ * 所以返回 false 不报警，调用者据此决定要不要 push。 */
+static bool sleep_list_unlink(struct fe_thread *t)
+{
+    struct fe_thread **pp = &g_sleep_list;
+    u32 guard = 0;
+    while (*pp) {
+        if (++guard > 8192) {
+            fe_panic("睡眠链表成环（调度器内部一致性被破坏）");
+        }
+        if (*pp == t) {
+            *pp = t->sleep_next;
+            t->sleep_next = NULL;
+            return true;
+        }
+        pp = &(*pp)->sleep_next;
+    }
+    return false;
+}
+
 void fe_sched_block_current(void)
 {
     struct fe_thread *t = g_current;
@@ -889,20 +926,38 @@ void fe_sched_wake(struct fe_thread *t)
         t->state = FE_THREAD_READY;
         rq_push(t);
     } else if (t->state == FE_THREAD_SLEEPING) {
-        /* ★ 只点名、**不动它**（第 5 步第二步的收窄）★
-         * 叫醒 SLEEPING 是 **D3 的修复范围**，不属于"队列卫生"这一步：
-         * 把它做进来会偷偷修掉 D3，让"D 组仍如实变红"这条判据失去意义
-         * ——单一变量优先于"顺手修好"。 */
-        fe_kprintf("[调度] **fe_sched_wake 收到 SLEEPING 的线程**：%s(id=%llu)"
-                   "（本步不动它——叫醒睡眠是 D3 的修复范围；调用者=%#llx）\n",
-                   t->name, (unsigned long long)t->id,
-                   (unsigned long long)(uptr)__builtin_return_address(0));
+        /* ★ D3：睡眠中的线程**真的被叫醒** ★
+         *
+         * ★ 这一步之前是"只点名、不动它"——那是刻意的单一变量 ★
+         * 第 5 步做队列卫生时把这里收窄成"只接受 BLOCKED、SLEEPING 只点名"，
+         * 为的是不偷偷修掉 D3、让"D 组仍如实变红"这条判据失去意义。
+         * 现在到修它的时候了：点名那行换成真的叫醒。
+         *
+         * ★ 为什么"叫醒睡眠"是必须的（不是优化）★
+         * `fe_task_terminate` / `fe_task_kill_other_threads` 把 SLEEPING
+         * 归进"自己走不到闸门、必须把它们叫醒"那一支（process.c 的循环）。
+         * 而 `FE_SYS_SLEEP` 的入参是纳秒：一个"睡 30 天"的工作线程原来要
+         * 睡到点才醒、才走到闸门 ⇒ `exec` 会被拖到超时。实测（D 组基线）：
+         * `**D3 失败**：睡 60 s 的线程被标记后 100 ms 内仍是状态 3`。
+         *
+         * ★ 顺序：**先摘链，再改状态 + 入队** ★
+         * 反过来的话有一个窗口：状态已是 READY、而链上还挂着它——
+         * 那一刻若节拍到了，`wake_sleepers` 会把它当"刚睡醒"再处理一次
+         * （重复 rq_push ⇒ 队列上出现两条同样的链，或"已经在队里"的
+         * 告警）。摘链在前，这个窗口就不存在。
+         *
+         * ★ 重复叫醒是无害的 ★ 摘链失败（它已经被 wake_sleepers 摘走、
+         * 或已经被叫醒过）时**照样**置 READY + 入队：`rq_push` 自己带
+         * "已经在队里就丢弃"的守卫，所以这里不需要第二份判据。 */
+        sleep_list_unlink(t);
+        t->state = FE_THREAD_READY;
+        rq_push(t);
     } else {
         fe_kprintf("[调度] **fe_sched_wake 收到状态不对的线程**：%s(id=%llu "
-                   "state=%u)（只接受 BLOCKED=%u；调用者=%#llx）"
+                   "state=%u)（只接受 BLOCKED=%u 与 SLEEPING=%u；调用者=%#llx）"
                    "——指针在册，所以这些字段是可信的\n",
                    t->name, (unsigned long long)t->id, t->state,
-                   FE_THREAD_BLOCKED,
+                   FE_THREAD_BLOCKED, FE_THREAD_SLEEPING,
                    (unsigned long long)(uptr)__builtin_return_address(0));
     }
     fe_irq_restore(irq);
