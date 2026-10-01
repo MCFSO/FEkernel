@@ -573,27 +573,50 @@ u32 fe_task_cleanup_probes(struct fe_task *task, const char *tag)
      * 一模一样。这个错误在这里犯过一次（原来传的是 `NULL`），
      * 所以留一条断言把它钉住。 */
     struct fe_thread *self = fe_thread_current();
+    u32 before = fe_task_thread_count(task);
+    /* ★ `keep` 不许为 `NULL`（对照实验的结论，第 5 步）★
+     *
+     * `NULL` 的语义是"一个都不留"，那是 `fe_task_terminate` 的（整个任务
+     * 完蛋，连主线程一起走）；**清场的语义永远是"调用者之外的所有人"**，
+     * 而"之外"必须由调用者显式给出。
+     *
+     * ★ 这条结论是**做对照实验做出来的**，不是读代码读出来的 ★
+     * 第一版我把它写成 `NULL`，后来又**同时**改成 `self` 并加了断言——
+     * 于是断言永远不可能触发（`keep = self` 本身就保证 `self` 不被标记），
+     * 那次"否证"其实是**实验设计错了**（判据比意图宽松）。
+     * 重做时把 `keep` 临时改回 `NULL`、断言留在原地：**断言一声没响**，
+     * 而且打印里第一次能看见"清的是谁的表"：
+     * `收尾：D1（任务 d1-notify id=26，清前共 1 个线程）的 1 个探针已清理`
+     * —— 探针确实在探针任务里，`main`（内核任务）不在那张表里，
+     * 所以 `NULL` 并没有把它标记上。**这条假设到此才算真正被否证。** */
     u32 marked = fe_task_kill_other_threads(task, self);
     if (self && self->kill_pending) {
         fe_kprintf("        **收尾把自己标记了**：调用者 %s(id=%llu) 处于"
-                   " kill_pending —— 清场动作绝不该包含调用者，"
-                   "它会在下一次经过闸门时被判死\n",
-                   self->name, (unsigned long long)self->id);
+                   " kill_pending（tag=%s，任务 %s）—— 清场动作绝不该包含"
+                   "调用者，它会在下一次经过闸门时被判死\n",
+                   self->name, (unsigned long long)self->id, tag, task->name);
     }
     /* 给被标记的探针几次调度机会：它们要么走到闸门、要么走进取消点。
      * 用"睡 2 ms"而不是"让出"——让出只在当前线程自己的时间片里转，
      * 被唤醒的线程可能一次都选不上（实测过）。 */
-    for (u32 i = 0; i < 50 && fe_task_thread_count(task) > 0; i++) {
+    u32 round = 0;
+    for (; round < 50 && fe_task_thread_count(task) > 0; round++) {
         fe_thread_sleep_ms(2);
     }
     u32 left = fe_task_thread_count(task);
     if (left == 0) {
-        fe_kprintf("        收尾：%s 的 %u 个探针已清理\n", tag, marked);
+        /* 打印里带**任务身份与线程数**："它清的是谁的表"要一眼可见
+         * （对照实验里就是这一行把"探针属于哪个任务"钉死的）。 */
+        fe_kprintf("        收尾：%s（任务 %s id=%llu，清前共 %u 个线程，"
+                   "等了 %u 轮）的 %u 个探针已清理\n", tag, task->name,
+                   (unsigned long long)task->id, before, round, marked);
         return 0;
     }
-    fe_kprintf("        收尾：%s 标记了 %u 个，仍有 %u 个**清不掉**"
+    fe_kprintf("        收尾：%s（任务 %s id=%llu，清前共 %u 个线程，"
+               "等了 %u 轮）标记了 %u 个，仍有 %u 个**清不掉**"
                "（卡在没有取消点的等待或长睡眠上，要等对应修复）:\n",
-               tag, marked, left);
+               tag, task->name, (unsigned long long)task->id, before,
+               round, marked, left);
     for (struct fe_thread *t = fe_task_thread_first(task); t;
          t = fe_thread_next_of(t)) {
         fe_kprintf("          残留：name=%s id=%llu state=%u wait=%s\n",
