@@ -109,11 +109,28 @@ bool fe_irq_mode_ok(u32 irq, u32 require_mode);
  * ★ 分工 ★ 发现能力结构是**用户态**的事（PCI 协议知识，是策略）；
  * "分配向量 + 算出消息地址/数据 + 绑定通知对象"是**内核**的事
  * （向量是内核的资源，而且分配向量与让设备会发消息必须原子）。
- * MSI-X 的表项由**驱动**自己写——表在它的 BAR 里，内核不该去映射
- * 一段属于别人的 BAR。
+ * ★ **MSI-X 的表项也由内核代写** ★——就在 `fe_irq_msi_alloc` 里：
+ * 映那 16 字节 MMIO、写 addr/data/控制字、再置 Enable、清 Function Mask，
+ * 整套在一次调用里做完。**驱动不要再写第二遍。**
  *
- * ★ 安全边界 ★ 驱动拿到 (addr,data) 之后确实可以给别人制造伪中断，
- * 但共享 INTx 下它本来就能（内核无法分辨是哪台设备）。**这不是新能力。** */
+ * **原先写的是**："MSI-X 的表项由**驱动**自己写——表在它的 BAR 里，
+ * 内核不该去映射一段属于别人的 BAR。"
+ * **实测推翻了它**（`docs/14-interrupt-semantics.md` §8.1）：QEMU 的
+ * virtio-blk-pci 把 MSI-X 表放在 **BAR1**，而驱动只映射了 **BAR4**——
+ * 驱动手里根本没有表项所在的那段映射，"让驱动自己写"在真实设备上走不通。
+ * 内核用 `fe_vmm_map_mmio` 把表项映进自己已有的 MMIO 窗口写一次，
+ * **不产生任何所有权声明**（资源池里 BAR1 归谁完全不受影响）；
+ * 而且这一换**能力面反而更小**：驱动拿不到"往别人表项里填向量"这条路了。
+ * `struct fe_msi_info` 里的 `table_bar` / `table_offset` **只是诊断信息**，
+ * **不是"轮到你写"的信号**（见下面那两个字段的注释）。
+ *
+ * ★ 表项号也由内核这一层定 ★ 用户态那层 ABI 没有"表项号"参数，
+ * `kernel/arch/x86_64/syscall.c` 的 `sys_irq_msi_alloc` 固定传 `flags = 0`，
+ * 所以今天写进去的**永远是第 0 项**（virtio 的队列 0 用它，正好对得上）。
+ *
+ * ★ 安全边界 ★ 内核代写之后，驱动**没有**"给别人制造伪中断"这条路了——
+ * 它只能等自己那一位。共享 INTx 下"内核无法分辨是哪台设备"那件事
+ * 仍然在（见 §2.2）。 */
 
 #define FE_MSI_KIND_MSI   1u
 #define FE_MSI_KIND_MSIX  2u
@@ -123,10 +140,16 @@ struct fe_msi_info {
     u8  vector;
     u8  kind;           /* FE_MSI_KIND_* */
     u8  _pad[2];
-    u32 table_bar;      /* MSI-X：表在哪个 BAR（0..5）；MSI 为 0xFF */
-    u32 table_offset;   /* MSI-X：表相对该 BAR 的字节偏移 */
-    u32 data;           /* 消息数据（= 向量 | 边沿 | assert） */
-    u64 addr;           /* 消息地址（LAPIC 的 MSI 窗口 | 目的 APIC ID） */
+    u32 table_bar;      /* MSI-X：表在哪个 BAR（0..5）；MSI 为 0xFF。
+                         * ★ 诊断用 ★ 只说明内核把表项写在哪儿。
+                         * **不要**拿它去换算表项地址、更**不要**往那里写——
+                         * 表项在 `fe_irq_msi_alloc` 里就已经由内核写好了。 */
+    u32 table_offset;   /* MSI-X：表相对该 BAR 的字节偏移。★ 诊断用，同上 ★
+                         * 它是给日志/排障看的，**不是**一个"轮到你写"的信号。 */
+    u32 data;           /* 内核算出的消息数据（= 向量 | 边沿 | assert）。
+                         * 已经写进表项；给出只是让调用者能核对/打印。 */
+    u64 addr;           /* 内核算出的消息地址（LAPIC 的 MSI 窗口 | 目的 APIC ID）。
+                         * 同上：已经写进表项，**不要**自己再写。 */
 };
 /* 用户态按 32 字节读这一份（见 user/include/fe_user.h 的镜像定义）。 */
 _Static_assert(sizeof(struct fe_msi_info) == 32,
@@ -134,7 +157,13 @@ _Static_assert(sizeof(struct fe_msi_info) == 32,
 
 /* 为一台设备使能 MSI / MSI-X，并把中断绑到 nt。
  * cap_off 是能力结构在配置空间里的偏移（由设备管理器发现并传下来）；
- * flags 是 MSI-X 的**表项号**（virtio 的队列 0 用 0；MSI 忽略它）。 */
+ * flags 是 MSI-X 的**表项号**（MSI 忽略它）。
+ * ★ `flags` 是**内核侧**的参数，用户态那层 ABI 没有它 ★
+ * `fe_irq_msi_alloc(nt, bus, dev, fn, cap_off, &mi)` 到
+ * `kernel/arch/x86_64/syscall.c` 的 `sys_irq_msi_alloc` 固定传 `flags = 0`，
+ * 所以今天经 syscall 进来的请求**写的永远是第 0 项**
+ * （virtio 的队列 0 用第 0 项，正好对得上）。
+ * 要支持别的表项，改的是 syscall 那一层的参数，**不是**让驱动自己写表。 */
 fe_status_t fe_irq_msi_alloc(u64 bus, u64 dev, u64 fn, u64 cap_off, u32 flags,
                              struct fe_notification *nt, u64 owner,
                              struct fe_msi_info *out);

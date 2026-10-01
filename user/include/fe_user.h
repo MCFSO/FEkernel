@@ -554,19 +554,36 @@ long fe_irq_ack(u64 irq);
  *
  * 用法（MSI-X）：
  *   1. `fe_irq_msi_alloc(nt, bus, dev, fn, cap_off, &mi)`；
- *   2. 把 `mi.addr` / `mi.data` 写进 MSI-X 表的**第 0 项**
- *      （位置 = 你映射好的 `mi.table_bar` 那个 BAR 的 `mi.table_offset` 处，
- *        每项 16 字节：addr 低 32 / addr 高 32 / data / 控制字）；
+ *   2. ★ **不需要写表项** ★——`mi.addr` / `mi.data` 与向量控制字**由内核在
+ *      第 1 步里就写进 MSI-X 表了**，连使能位一起置好；驱动**不要再写第二遍**
+ *      （原因见下）。★ 这一层 ABI **没有"表项号"参数**：内核 syscall 层固定传 0
+ *      （`kernel/arch/x86_64/syscall.c` 的 `sys_irq_msi_alloc` 调
+ *      `fe_irq_msi_alloc(…, flags=0, …)`），所以**写进去的永远是第 0 项**，
+ *      驱动也无法指定别的项——virtio 的队列 0 用第 0 项，正好对得上；
  *   3. 等 `1 << mi.irq` 这一位（`fe_notification_wait`）；
  *   4. 退出前 `fe_irq_msi_free(mi.irq)`。
  *
- * ★ 为什么表项由驱动写而不是内核 ★ 表在设备的 BAR 里，而 BAR 的映射
- * 是驱动自己的事（资源池 + fe_mmio_map）。内核要写它就得先映射一段
- * 属于别人的 BAR——那正是资源池要避免的。
+ * ★ 为什么表项由内核代写（这一段是实测之后改的，读的人请按新的做）★
+ * **原先写的是**："表项由**驱动**写——`mi.table_bar` 那个 BAR 是驱动自己
+ * 映射过的，把 addr/data 写进 `mi.table_offset` 处；内核不该去映射一段
+ * 属于别人的 BAR。"
+ * **实测推翻了它**（`docs/14-interrupt-semantics.md` §8.1）：QEMU 的
+ * virtio-blk-pci 把 MSI-X 表放在 **BAR1**，而驱动只映射了 **BAR4**
+ * （virtio 四类结构所在的那一段）——**驱动手里根本没有表项所在的那段映射**，
+ * "让驱动自己写"在真实设备上直接走不通。
+ * 现在改由**内核代写**：它本来就要读那个 BAR 的**地址**（不然算不出表项在哪），
+ * 于是用 `fe_vmm_map_mmio` 把表项那 16 字节映到**内核自己的 MMIO 窗口**写一次，
+ * 写完置 Enable、清 Function Mask。**这不产生任何所有权声明**——
+ * 资源池里 BAR1 归谁完全不受影响。
  *
- * ★ 安全边界（说清楚）★ 驱动拿到 (addr,data) 之后可以给别人制造伪中断，
- * 但**共享 INTx 下它本来就能**（线的语义就是"内核无法分辨是谁"）。
- * 所以这不是一项新能力。 */
+ * ★ 所以别再去写第二遍 ★ 两件事都会出错：一是**重复**（表项已经是内核写的），
+ * 二是**通常无处可写**（表在 BAR1，而你只有 BAR4 的映射）。
+ * `mi.table_bar` / `mi.table_offset` 现在只是**诊断信息**（让你知道内核把表
+ * 写在哪儿），见 `struct fe_msi_info` 里那两个字段的注释。
+ *
+ * ★ 安全边界（说清楚）★ 这一换**能力面反而更小**：驱动拿不到"往别人表项里
+ * 填向量"这条路了，内核只写它自己分配的那个向量。而共享 INTx 下
+ * "内核无法分辨是哪台设备"那件事本来就在，见 §2.2。 */
 #define FE_MSI_KIND_MSI   1u
 #define FE_MSI_KIND_MSIX  2u
 struct fe_msi_info {
@@ -574,10 +591,17 @@ struct fe_msi_info {
     u8  vector;
     u8  kind;           /* FE_MSI_KIND_* */
     u8  _pad[2];
-    u32 table_bar;      /* MSI-X：表在哪个 BAR（0..5）；MSI 为 0xFF */
-    u32 table_offset;   /* MSI-X：表相对该 BAR 的字节偏移 */
-    u32 data;           /* 写进设备（或表项）的消息数据 */
-    u64 addr;           /* 写进设备（或表项）的消息地址 */
+    u32 table_bar;      /* MSI-X：表在哪个 BAR（0..5）；MSI 为 0xFF。
+                         * ★ 诊断用 ★ 只告诉你内核把表项写在哪儿。
+                         * **不要**拿它去换算表项地址、更**不要**往那里写——
+                         * 表项在 `fe_irq_msi_alloc` 里就已经由内核写好了
+                         * （见上面那段"为什么表项由内核代写"）。 */
+    u32 table_offset;   /* MSI-X：表相对该 BAR 的字节偏移。★ 诊断用，同上 ★
+                         * 它是给日志/排障看的，**不是**一个"轮到你写"的信号。 */
+    u32 data;           /* 内核算出的消息数据（= 向量 | 边沿 | assert）。
+                         * 已经写进表项；这里给出只是让你能核对/打印。 */
+    u64 addr;           /* 内核算出的消息地址（LAPIC 的 MSI 窗口 | 目的 APIC ID）。
+                         * 同上：已经写进表项，**不要**自己再写。 */
 };
 _Static_assert(sizeof(struct fe_msi_info) == 32,
                "fe_msi_info 与内核侧不一致（两边都是 32 字节）");
