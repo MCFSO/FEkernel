@@ -55,7 +55,7 @@
 |---|---|---|
 | **IPI 原语** | `fe_lapic_send_ipi(dest, vector)`（`lapic.h:75`） | IPI 机制现成，不用从头写 ICR 序列 |
 | **IOAPIC 路由带目标参数** | `fe_ioapic_route(gsi, vec, dest_apic_id, …)`（`ioapic.h:28`） | 中断定向只差一个**策略**，不差机制 |
-| **AP 启动可以交给引导器** | `LIMINE_MP_REQUEST` 已声明（`limine.h:51`），`fe_limine_mp_info.goto_address`（`:165`），`bootinfo.c` 已经在读 `cpu_count/bsp_lapic_id` | ★ **不需要手写实模式 trampoline** ★ 引导器把 AP 拉进长模式并跳到 `goto_address`。这与本项目一贯的分工一致：平台的事交给 Limine，OS 的事自己写 |
+| **AP 启动可以交给引导器** | `LIMINE_MP_REQUEST` 已声明（`limine.h:51`），`fe_limine_mp_info.goto_address`（`:165`），`bootinfo.c` 已经在读 `cpu_count/bsp_lapic_id` | ★ **不需要手写实模式 trampoline** ★ 引导器把 AP 拉进长模式并跳到 `goto_address`。这与本项目一贯的分工一致：平台的事交给 Limine，内核的事自己写 |
 | **只有一个上下文切换点** | `fe_sched_maybe_switch`（`sched.c:249`），被 `isr.asm` 与 `syscall.asm` 各调一次；它已经在更新 `fe_tss_set_rsp0` + `fe_syscall_set_kernel_stack`（`:274-275`） | 切换路径上"每 CPU 该更新的东西"**只有一个地方**，改成 per-CPU 就是改这一处。这是"切换一律发生在中断返回路径上"这个早期决定的直接红利 |
 | **GS 基址机制已存在** | `fe_syscall_msr_init(entry, percpu)` 会 `wrmsr(IA32_GS_BASE, percpu)` | 每 CPU 数据可以**零 asm 改动**落地（§5） |
 | **引用计数已经是原子的** | `object.c:36,47` 用 `__atomic_*` | 对象生命周期不用重做 |
@@ -310,7 +310,7 @@ SMP 下如果给它加一把普通自旋锁，就把磁盘路径串行化了。
 
 ## 10. AP 启动序列
 
-分工：**平台的事交给 Limine，OS 的事自己写。** Limine 的 MP 协议会把 AP
+分工：**平台的事交给 Limine，内核的事自己写。** Limine 的 MP 协议会把 AP
 拉进长模式（页表已经是内核的）、中断关闭，然后跳到我们设的 `goto_address`，
 参数是该核的 `fe_limine_mp_info *`。
 

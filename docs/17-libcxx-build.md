@@ -159,7 +159,7 @@ libc++abi 在**没有 `__cxa_atexit` 的宿主**上会退到 `atexit`——但�
 | `pthread_cond_*` | ★ **缺** | 同上 |
 | `pthread_once` | **缺** | 同上。理论上可由 `pthread_mutex` + 原子变量拼出来，但要先有 mutex |
 | `pthread_key_*`（`thread_local` 的析构） | **缺** | 同上 |
-| TLS 基址（`thread_local` 的前提） | **有** | K9 已完成（`docs/11-kernel-next.md:56`）；`docs/08-os-completion.md:189` 记着内核从 `PT_TLS` 取初始化映像、每线程复制一份、切换时 `wrmsr(IA32_FS_BASE)` |
+| TLS 基址（`thread_local` 的前提） | **有** | K9 已完成（`docs/11-kernel-next.md:56`）；`docs/08-kernel-completion.md:189` 记着内核从 `PT_TLS` 取初始化映像、每线程复制一份、切换时 `wrmsr(IA32_FS_BASE)` |
 
 ★ `pthread_join` 缺的不是实现，是原语 ★
 `fe_thread_create` 返回的是**线程 id**（`kernel/task/user.c:546` 的 `return th ? th->id : 0;`），
@@ -242,7 +242,7 @@ if (v != v) {                       /* NaN：自己判，不用 <math.h> */
 | `fe_clock_ns()`（单调、纳秒、TSC 制） | **有** | `user/libfe/libfe.c:111-114`；K7 完成（`docs/11-kernel-next.md:54`） |
 | `fe_clock_info()`（自述精度） | **有** | `user/libfe/libfe.c:118-124`；`user/include/fe_user.h:430-438` |
 | `clock_gettime` | ★ **缺** | 全项目搜 → 0 处。**可包**：`CLOCK_MONOTONIC` ← `fe_clock_ns()` |
-| `CLOCK_REALTIME` | ★ **缺，且不该假装有** | 没有 RTC。`posix.c:476-501` 的注释立了规矩："时间戳一律 0：没有 RTC……**报 0 而不是编一个时间**"（`docs/08-os-completion.md` 已知限制 #6 同条） |
+| `CLOCK_REALTIME` | ★ **缺，且不该假装有** | 没有 RTC。`posix.c:476-501` 的注释立了规矩："时间戳一律 0：没有 RTC……**报 0 而不是编一个时间**"（`docs/08-kernel-completion.md` 已知限制 #6 同条） |
 | `nanosleep` | **缺** | 但底座在：`usleep` 已实现（`user/libposix/posix.c:750-758`），**粒度是 1 ms**（`posix.c:753-755`：不足 1 ms 也要真的让出一次） |
 | `sleep` | **有** | `user/libposix/posix.c:744-748` |
 | `time.h` / `sys/time.h` | ★ **缺** | 全项目搜 → 0 处 |
@@ -368,7 +368,7 @@ libc++ 对 locale 相关的 C 函数（`setlocale`、`localeconv`、`strftime`�
 | 谁来驱动 | 宿主上的 CMake + Ninja | 目标机上的 CMake/make（S6 的产物） |
 | 今天能不能做 | ★ **今天就能做**（前提见 §3.3） | 不能。S6/S7 都还没做 |
 | 需要先写什么 | **一个 CMake toolchain file**（`x86_64-unknown-none-elf`） | 整个 S1–S7 |
-| 暴露什么 | 只暴露"这套运行库配不配得起来" | **外加**整个操作系统（进程、管道、shell、文件系统、内存） |
+| 暴露什么 | 只暴露"这套运行库配不配得起来" | **外加**整个平台（进程、管道、shell、文件系统、内存） |
 | 失败时的诊断成本 | 低（宿主上有完整的工具与日志） | 高（失败可能出在任何一层） |
 | 与"本机自举终局"的关系 | ★ **不冲突**，见 §3.3 | 终局本身 |
 

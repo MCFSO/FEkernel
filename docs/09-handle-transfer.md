@@ -241,7 +241,7 @@ fe_endpoint_recv(reply_ep)   ← 拿到"写完了"的应答（载荷只有几十
 
 根因是**内核的单调时钟是按节拍算的**（`fe_time_ms()` = 节拍数 / 每毫秒节拍数），
 而节拍间隔在 QEMU 是 1 ms、在 VBox 是 6~20 ms（VBox 对中断投递限流，见
-`08-os-completion.md` §6 第 5 条与 `01-milestones.md` 的实测记录）。
+`08-kernel-completion.md` §6 第 5 条与 `01-milestones.md` 的实测记录）。
 往返不足一个节拍时，两次读数一模一样，差值必然是 0。
 
 所以工具现在先做一次**刻度自证**（睡 50 ms 再量它，QEMU 与 VBox 都是 100%），

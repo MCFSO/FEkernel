@@ -22,7 +22,7 @@
 已经没有 PS/2 口，或者只有一个组合口、默认走 USB 控制器。
 
 ★ 所以这条不是"多一个驱动"，而是**"这台系统在真机上能不能被人操作"** ★
-`08-os-completion.md` 的 C3 判据是"键盘输入进 shell：行编辑、回车执行、退格可见"，
+`08-kernel-completion.md` 的 C3 判据是"键盘输入进 shell：行编辑、回车执行、退格可见"，
 而它今天**只在 PS/2 存在的机器上成立**。这个前提从来没写下来过。
 
 ### 1.2 可移动介质是最常见的"系统外数据来源"
@@ -109,7 +109,7 @@ U 盘（FAT32，含 EFI/BOOT/BOOTX64.EFI = Limine）
 | 一块**物理连续、有物理地址**的内存给设备写 | `fe_mem_alloc_dma(size)` + `fe_mem_info(handle, &info)` 拿物理基址 | `user/include/fe_user.h:440`/`:448`；`struct fe_mem_info` 在 `:393-398`（`phys`/`size`/`flags`/`page_count`） |
 | 驱动里怎么用 | `fe_mem_alloc_dma` 给对象、`fe_mem_info` 给物理基址、`fe_mem_map` 给虚拟地址 | `user/libdrv/virtio.c:13` 的注释逐字 |
 | **为什么不能拿任意内存去 DMA** | 只有 DMA 对象有物理地址；普通映射的帧不保证连续 | `user/include/fe_drv.h:46`："所以驱动不能拿任意一块内存去 DMA——必须先问 `fe_mem_alloc_dma` 要" |
-| 已实测到什么程度 | 8 KiB DMA 对象、物理基址 4 KiB 对齐、映射后读写一致 | `08-os-completion.md:24`（C7 行） |
+| 已实测到什么程度 | 8 KiB DMA 对象、物理基址 4 KiB 对齐、映射后读写一致 | `08-kernel-completion.md:24`（C7 行） |
 | 真的 DMA 走通了吗 | ✅ **M14 已完成**：virtio-blk + 共享内存批量，QEMU+WHPX 实测 **130416 → 1266 周期/KiB**（103 倍），且该倍数本身是**会失败的断言** | `01-milestones.md:22`（M14 行）；设计与边界见 `12-drivers.md` §9 |
 
 ★ USB 用的 DMA 比 virtio-blk 更零碎（TRB 环、设备上下文、transfer buffer 各一块），
@@ -400,7 +400,7 @@ transfer buffer）都是一次 `fe_mem_alloc_dma` + `fe_mem_map`。
 
 ### 7.1 它**不挡** C1/C2/C3
 
-`08-os-completion.md` §1 的完成判据里，C1/C2 已完成（帧缓冲移交 + 屏幕可读文字），
+`08-kernel-completion.md` §1 的完成判据里，C1/C2 已完成（帧缓冲移交 + 屏幕可读文字），
 C3（"键盘输入进 shell"）也已标记 ✅——**但 C3 的成立有一个从未写下来的前提：
 这台机器上有 PS/2**（§1.1）。USB 补的是那个前提，**不是 C3 的实现**。
 

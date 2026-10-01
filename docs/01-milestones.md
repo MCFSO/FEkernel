@@ -13,7 +13,7 @@
 | M5 | **驱动能力 ABI + 硬件资源池** | 每任务 I/O 权限位图（TSS 槽位）、`fe_ioport_request`/`fe_mmio_map`/`fe_irq_register`/`fe_mem_info`、资源池互斥认领、中断投递到通知对象 | ring 3 驱动**认领前**执行 `in` 被 #GP 精确拦下，**认领后**同一条指令跑通；可用内存不可被映射为 MMIO |
 | M6 | **第一批驱动服务** | `init`、PS/2 键鼠两个用户态服务、帧缓冲控制台（自研点阵字体） | 屏幕上出现图形控制台输出，键盘输入能回显 |
 | M7 | **devfs 服务发现 + 块设备** | `devfs`（BSD 式：命名空间即文件系统）；`blkd`（ATA PIO）发布 `/dev/blk0` | 客户端只用路径 `/dev/blk0` 就能找到服务，读回扇区并解析出 MBR / FAT32 BPB |
-| M8 | **FAT32 + 保护层** | `fsd` FAT32 服务（只读）；**A/B 无缝更新 + 扇区保护 + 槽状态机**（见 `05-ab-update.md`）；`pcid` PCI 枚举 | ✅ 只读、保护层/更新、**以及文件系统写路径**均完成并实测（双环境）——写路径见 `08-os-completion.md` §9（S2 第一步：屏幕上的一次完整验证）；⬜ 槽改分区 |
+| M8 | **FAT32 + 保护层** | `fsd` FAT32 服务（只读）；**A/B 无缝更新 + 扇区保护 + 槽状态机**（见 `05-ab-update.md`）；`pcid` PCI 枚举 | ✅ 只读、保护层/更新、**以及文件系统写路径**均完成并实测（双环境）——写路径见 `08-kernel-completion.md` §9（S2 第一步：屏幕上的一次完整验证）；⬜ 槽改分区 |
 | M9 | **网络栈** | `netd`（e1000 + virtio-net）+ `ipd`（ARP/IPv4/ICMP/UDP/TCP） | 从 QEMU 用户网络里 DHCP 或静态配置后 `ping` 通网关，TCP echo 成功 |
 | M10 | **SMP** | AP 启动（Limine MP）、每 CPU 结构、自旋锁、IPI、TLB、负载均衡；设计见 `06-smp.md` | **可测量的指标**：N=2 加速比 ≥1.7、N=4 ≥3.0；一个核做 I/O 时另一个核的 RPC p99 退化 <10%；`--smp 1` 不退化超过 5% |
 | M11 | **真机 + 双虚拟机验证** | U 盘镜像；VirtualBox 与 QEMU(WHPX) 双跑；文档 | 真机从 U 盘启动进入图形控制台；VBox 中同样可启动 |
@@ -352,10 +352,10 @@ user/hello/main.c               用户态测试程序
       （`FE_SYS_FB_INFO` + 资源池 MMIO 入池）；自绘 5x7 字体（`tools/mkfont.py`
       生成，95 字形）；**读回像素与位图逐点比对 + 反向对照**双重证据；
       `tools/qemu_shot.py` 抓到屏幕实际内容（"FEKernel console (consoled)" 等 4 行）。
-      见 `docs/08-os-completion.md` §3
+      见 `docs/08-kernel-completion.md` §3
 - [x] **SIMD 打开暴露并修掉一个潜伏的 ABI bug**：用户线程初始栈少减 8 字节
       （把线程入口当成进程入口），`movaps` 一上就 #GP。见 `docs/08` §4
-- [x] **全面测试并修掉 3 个真 bug**（详见 `docs/08-os-completion.md` §7）：
+- [x] **全面测试并修掉 3 个真 bug**（详见 `docs/08-kernel-completion.md` §7）：
       ① `consoled` 回复复用了请求头 → 应答被截断（每个控制台客户端都会失败）；
       ② 鼠标 3 字节包解码**符号用了两次** → 数据字节 ≥128 时差 256；
       ③ 启动请求藏在 `build/esp/limine.conf` 里 → 一次普通启动偷偷做了 A/B 更新并重启。
