@@ -143,12 +143,19 @@ fe_status_t fe_msg_reply(struct fe_task *t, fe_handle_t reply_ep,
 /* 等待的**条件**类型。数值与用户 ABI（fe/syscall.h）一致。 */
 #define FE_WAIT_MSG  1      /* 端点上来了消息 */
 #define FE_WAIT_BITS 2      /* 通知对象上有掩码里的位被置位 */
+#define FE_WAIT_ADDR 3      /* ★ K11 ★ 一个用户地址上的值**不再等于**期望值 */
 
-/* 一个等待目标：句柄 + 条件 + 通知掩码（FE_WAIT_BITS 时才用） */
+/* 一个等待目标：句柄 + 条件 + 通知掩码（FE_WAIT_BITS 时才用）
+ *                          + 用户地址三项（FE_WAIT_ADDR 时才用） */
 struct fe_wait_target {
     fe_handle_t handle;
     u32 kind;               /* FE_WAIT_* */
     u64 mask;               /* FE_WAIT_BITS：等哪些位 */
+    /* ★ K11：只有 kind == FE_WAIT_ADDR 用这三项 ★
+     * 设计与代价见 docs/21-user-address-wait.md §4.2。 */
+    u64 addr;               /* 本地址空间里的用户地址，**必须 4 字节对齐** */
+    u64 expected;           /* 期望的 u32 值（值≠它就**不睡**，返回 AGAIN）*/
+    u64 deadline_ns;        /* **绝对**单调纳秒；0 = 无限等 */
 };
 
 /* 一次等待的结果。`index` 是**第几个目标**就绪（0 起）。 */
@@ -186,6 +193,55 @@ struct fe_wait_result {
 fe_status_t fe_wait_any(struct fe_task *t, const struct fe_wait_target *targets,
                         u32 n, struct fe_wait_result *res,
                         u32 payload_cap);
+
+/* ★ 自检钩子（K11 的 W2）：**只给自检用**，生产路径上恒为 NULL ★
+ *
+ * 它在"已经检查过一遍、还没登记"的那一刻被调用 —— 那正是丢唤醒窗口。
+ * 自检用它把窗口确定性地造出来（钩子当场把条件置真 + 调一次唤醒），
+ * 于是"漏醒"变成可复现的红，而不是靠概率。
+ * 实现与调用点见 kernel/ipc/ipc.c 的 fe_wait_any。 */
+void fe_wait_any_set_hook(void (*fn)(struct fe_task *, const struct fe_wait_target *,
+                                     u32, void *), void *ctx);
+
+/* ------------------------------------------------------------------ */
+/* 等一个用户地址（K11，docs/21-user-address-wait.md）                 */
+/* ------------------------------------------------------------------ */
+
+/* 等 `t->space` 里 `addr` 处的 u32 **不再等于** `expected`。
+ *
+ * 语义（逐条都能证伪，见 docs/21 §4.2）：
+ *   - `FE_OK`          被唤醒（**必须重查**：内核不保证为什么醒）；
+ *   - `FE_ERR_AGAIN`   值**不等于**期望（**没有睡过**——这就是 futex 的 EAGAIN）；
+ *   - `FE_ERR_TIMEOUT` deadline 到了；
+ *   - `FE_ERR_FAULT`   地址读不了（未映射/不可读）——**不是**"值不相等"；
+ *   - `FE_ERR_CANCELED` 线程被取消 / 任务被终止；
+ *   - `FE_ERR_INVAL`   地址没 4 字节对齐。
+ *
+ * ★ 原子性（这是这个机制存在的**全部理由**）★ "读值"与"挂上等待链 +
+ * 置 BLOCKED"在**同一个关中断区间**里完成，所以不存在"值在我检查之后、
+ * 睡下之前被改掉，而我照样睡死"那个窗口。窗口的存在性由自检 W2 证明
+ * （它用钩子把窗口确定性地造出来，修之前是红的）。
+ *
+ * ★ 唤醒是"点名"，不是"投递" ★ 返回 `FE_OK` 只说明"有人叫了你"，
+ * 条件的真假**必须由调用者自己重查**——这条契约让伪唤醒（超时、
+ * broadcast 波及、取消）自动变成正确行为。 */
+fe_status_t fe_wait_addr(struct fe_task *t, u64 addr, u64 expected, u64 deadline_ns);
+
+/* 唤醒 `t->space` 里等在 `addr` 上的至多 `count` 个线程（`count == 0` = 全部）。
+ * 返回实际唤醒的个数。★ 键是 `(地址空间, 地址)`：别的任务在**同一个虚拟
+ * 地址**上等的一个都不许被唤醒（W4 就是堵这个）★ */
+u32 fe_wake_addr(struct fe_address_space *space, u64 addr, u32 count);
+
+/* ★ 只给自检用的只读访问器 ★ 数一个地址上有几个等待者（键要一起对上）。
+ * 为什么需要它：判据必须是**可读的事实**，而不是"跑起来没崩"
+ * （与 `fe_notification_waiter` 同一条理由，见 docs/13 §6.5 的教训）。 */
+u32 fe_wait_addr_waiters(struct fe_address_space *space, u64 addr);
+
+/* ★ 只给调度器调 ★ 一个带 deadline 的地址等待到点了：把线程从地址链上
+ * 摘掉（状态与就绪队列**不归这里管**，归 sched.c）。
+ * 为什么要有它：线程在两条链上，而"到点"那条路径由 sched.c 发现——
+ * 它不认识地址桶，所以走这个回调。docs/21 §5.3。 */
+void fe_wait_addr_on_deadline(struct fe_thread *t);
 
 /* 同步调用：发请求并等待回复（内部建立临时回复端点） */
 fe_status_t fe_endpoint_call(struct fe_task *t, fe_handle_t ep,
@@ -250,6 +306,10 @@ struct fe_thread *fe_notification_waiter(const struct fe_notification *nt);
 /* 自检：多对象等待（wait_any：已就绪、被通知唤醒、被消息唤醒）。
  * 返回失败项数。 */
 u32 fe_selftest_wait_any(void);
+
+/* K11 的自检（丢唤醒窗口 W2、键、容量、取消、超时……）。
+ * 返回失败项数。设计与逐条判据见 docs/21-user-address-wait.md §7.1。 */
+u32 fe_selftest_wait_addr(void);
 
 /* M3 自检：返回失败项数（0 = 全部通过） */
 u32 fe_selftest_ipc(void);

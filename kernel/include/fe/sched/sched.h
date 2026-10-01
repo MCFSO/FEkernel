@@ -50,9 +50,20 @@ void fe_sched_yield_current(void);
  * 唤醒会提前几倍返回（VBox 实测 sleep(50ms) 只用 14 ms）。 */
 void fe_sched_sleep_until(u64 wake_ns);
 
-/* 把一个线程置为阻塞（唤醒由其它机制负责，M3 的 IPC 用） */
+/* 把一个线程置为阻塞（唤醒由其它机制负责，M3 的 IPC 用）。
+ *
+ * ★ K11（docs/21 §3.4 ③）：它现在是**幂等**的 ★
+ * 只有状态还是 RUNNING 时才置 BLOCKED。等待路径已经在自己的关中断区间里
+ * 把状态置好了，所以这里的正常行为是"什么都不做"；而如果唤醒抢在前面
+ * 把它置成了 READY，这里**不许**再压回去（那会把那次唤醒吃掉）。 */
 void fe_sched_block_current(void);
 void fe_sched_wake(struct fe_thread *t);
+
+/* ★ K11：把一个**已经关中断**的等待把自己挂进睡眠链，但**不改状态** ★
+ * 带 deadline 的地址等待用它（状态是 BLOCKED，却要"到点被叫醒"）。
+ * `wake_ns == 0` 表示无限等 ⇒ 什么都不做。
+ * ★ 调用者必须已经关中断 ★：它要与"登记进等待链"一起构成一个原子步。 */
+void fe_sched_sleep_arm(u64 wake_ns);
 
 /* 回收僵尸线程（M2 由 join 直接回收，这里供后续的 reaper 用） */
 u32 fe_sched_reap(void);

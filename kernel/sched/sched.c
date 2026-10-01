@@ -18,6 +18,7 @@
 #include <fe/syscall.h>
 #include <fe/process.h>
 #include <fe/fpu.h>
+#include <fe/ipc.h>             /* K11：fe_wait_addr_on_deadline（到点摘地址链） */
 
 /* ------------------------------------------------------------------ */
 /* 内部状态                                                            */
@@ -792,6 +793,37 @@ void fe_sched_yield_current(void)
  * 节拍只负责"过一会儿来看一眼"。代价是唤醒精度受限于节拍
  * （VBox 上最坏可能晚到几十毫秒），但方向是**只会晚、不会早**——
  * 这正是超时该有的方向。 */
+/* ★ 睡眠链的**唯一**插入点（K11 顺手统一）★
+ *
+ * ★ 为什么要有这么一个函数 ★ 到 K11 为止，"在不在睡眠链上"变成了一个
+ * **必须能被问出来**的事实：带 deadline 的地址等待会同时出现在"地址桶链"
+ * 与"睡眠链"上，而两条链的摘除责任必须只有一处答案（docs/21 §5.3）。
+ * 把插入收成一处，`sleep_armed` 就只在这里置、只在 `sleep_list_unlink` 里清。
+ * 调用者必须已关中断。 */
+static void sleep_list_insert(struct fe_thread *t, u64 wake_ns)
+{
+    t->wake_ns = wake_ns;
+    t->sleep_armed = 1u;
+    /* 按唤醒时刻升序插入，唤醒时只需从表头扫。
+     * 绝大多数情况下新线程的唤醒时刻晚于表头，因此先走「头部插入」这条快速路径，
+     * 避免每次睡眠都遍历链表（遍历仍保留环检测：链表被破坏时要明确报错而不是静默挂死）。 */
+    if (!g_sleep_list || g_sleep_list->wake_ns > wake_ns) {
+        t->sleep_next = g_sleep_list;
+        g_sleep_list = t;
+        return;
+    }
+    struct fe_thread **pp = &g_sleep_list;
+    u32 guard = 0;
+    while (*pp && (*pp)->wake_ns <= wake_ns) {
+        if (++guard > 8192) {
+            fe_panic("睡眠链表成环（调度器内部一致性被破坏）");
+        }
+        pp = &(*pp)->sleep_next;
+    }
+    t->sleep_next = *pp;
+    *pp = t;
+}
+
 void fe_sched_sleep_until(u64 wake_ns)
 {
     struct fe_thread *t = g_current;
@@ -799,32 +831,33 @@ void fe_sched_sleep_until(u64 wake_ns)
         return;
     }
     u64 irq = fe_irq_save();
-    t->wake_ns = wake_ns;
     t->state = FE_THREAD_SLEEPING;
-
-    /* 按唤醒时刻升序插入，唤醒时只需从表头扫。
-     * 绝大多数情况下新线程的唤醒时刻晚于表头，因此先走「头部插入」这条快速路径，
-     * 避免每次睡眠都遍历链表（遍历仍保留环检测：链表被破坏时要明确报错而不是静默挂死）。 */
-    if (!g_sleep_list || g_sleep_list->wake_ns > wake_ns) {
-        t->sleep_next = g_sleep_list;
-        g_sleep_list = t;
-    } else {
-        struct fe_thread **pp = &g_sleep_list;
-        u32 guard = 0;
-        while (*pp && (*pp)->wake_ns <= wake_ns) {
-            if (++guard > 8192) {
-                fe_panic("睡眠链表成环（调度器内部一致性被破坏）");
-            }
-            pp = &(*pp)->sleep_next;
-        }
-        t->sleep_next = *pp;
-        *pp = t;
-    }
+    sleep_list_insert(t, wake_ns);
     fe_irq_restore(irq);
 
     /* 走统一的切换路径：因为状态不是 RUNNING，不会把自己放回就绪队列 */
     fe_sched_request();
     __asm__ volatile("int %0" ::"i"(FE_VEC_YIELD));
+}
+
+/* ★ K11：把当前线程挂进睡眠链，但**不改状态** ★
+ *
+ * ★ 为什么需要它 ★ 带 deadline 的地址等待，线程状态是 `BLOCKED`
+ * （它在等一个地址，不是在睡），可是"到点"必须由睡眠链发现——
+ * 否则就要每个节拍扫一遍地址桶（O(桶数)），或者给每个等待单独挂定时器。
+ * 于是出现了"两条链、一个状态"这个形状，`wake_sleepers` 与唤醒路径
+ * 各摘一条（见 docs/21 §5.3 的三行对策）。
+ *
+ * ★ 调用者必须已经关中断 ★ 它要与"登记进地址链 + 置 BLOCKED"一起构成
+ * 一个原子步（docs/21 §3.4 ②）；自己在里面开区间会把这个原子步拆开，
+ * 那正是要修的窗口。 */
+void fe_sched_sleep_arm(u64 wake_ns)
+{
+    struct fe_thread *t = g_current;
+    if (!t || wake_ns == 0) {
+        return;                     /* 0 = 无限等：不上睡眠链 */
+    }
+    sleep_list_insert(t, wake_ns);
 }
 
 static void wake_sleepers(u64 now_ns)
@@ -833,7 +866,27 @@ static void wake_sleepers(u64 now_ns)
         struct fe_thread *t = g_sleep_list;
         g_sleep_list = t->sleep_next;
         t->sleep_next = NULL;
+        t->sleep_armed = 0u;
         if (t->state == FE_THREAD_SLEEPING) {
+            t->state = FE_THREAD_READY;
+            rq_push(t);
+        } else if (t->state == FE_THREAD_BLOCKED) {
+            /* ★ K11：带 deadline 的**地址等待**到点了 ★
+             *
+             * 它不在睡（状态是 BLOCKED），所以上面那一支不会碰它；
+             * 而"到点"这件事必须让它知道，否则它会一直等到有人 wake
+             * ——那正是 `pthread_cond_timedwait` 违约的形态。
+             *
+             * ★ 顺序：先记"我超时了"，再摘地址链，最后才置 READY ★
+             * 反过来的话有一个窗口：状态已是 READY（马上会被调度）、
+             * 而地址链上还挂着它——那一刻若有人 `wake` 同一个地址，
+             * 它会顺着链找到这个已经在跑的线程（多一次唤醒，无害但不干净）。
+             *
+             * ★ 摘地址链这一步必须问等待模块 ★ 调度器不认识那把桶，
+             * 所以走 `fe_wait_addr_on_deadline`（它只做"摘链 + 记标志"，
+             * 状态与就绪队列归调度器）。 */
+            t->wait_timed_out = 1u;
+            fe_wait_addr_on_deadline(t);
             t->state = FE_THREAD_READY;
             rq_push(t);
         }
@@ -870,6 +923,7 @@ static bool sleep_list_unlink(struct fe_thread *t)
         if (*pp == t) {
             *pp = t->sleep_next;
             t->sleep_next = NULL;
+            t->sleep_armed = 0u;        /* ★ K11：与 sleep_list_insert 配对 ★ */
             return true;
         }
         pp = &(*pp)->sleep_next;
@@ -883,7 +937,25 @@ void fe_sched_block_current(void)
     if (!t) {
         return;
     }
-    t->state = FE_THREAD_BLOCKED;
+    /* ★★ K11（docs/21 §3.4 ③）：这一句变成**幂等**的 ★★
+     *
+     * 原先它无条件置 BLOCKED，于是"登记完 → 恢复中断 → 走到这里"之间
+     * 有一个开着中断的窗口：落在那个窗口里的唤醒会被 `fe_sched_wake`
+     * 按"状态不对"丢弃（它只接受 BLOCKED/SLEEPING），而本函数随后又
+     * 把线程压回 BLOCKED ⇒ **那次唤醒白叫了**（症状：永久睡死）。
+     *
+     * 现在：登记路径已经在**同一个关中断区间里**把状态置成 BLOCKED
+     * （所以正常路径下这里本来就是 BLOCKED，什么都不做）；
+     * 而如果唤醒抢在前面把它置成了 READY，这里**不许**再压回去——
+     * 那说明"我早就该醒了"，让出之后会立刻被重新选中。
+     *
+     * ★ 为什么不是"永远不置" ★ 还有一批直接调用本函数的等待路径
+     * （端点接收、通知等待、控制器锁、目标任务）**没有**在区间里置状态，
+     * 它们仍然依赖这一句。见 docs/21 §3.1 的审计表：那四处的窗口还在，
+     * 属于已知的、与 K11 无关的既有债（诊断行是它的绊线）。 */
+    if (t->state == FE_THREAD_RUNNING) {
+        t->state = FE_THREAD_BLOCKED;
+    }
     fe_sched_request();
     __asm__ volatile("int %0" ::"i"(FE_VEC_YIELD));
 }
@@ -923,6 +995,14 @@ void fe_sched_wake(struct fe_thread *t)
     }
     u64 irq = fe_irq_save();
     if (t->state == FE_THREAD_BLOCKED) {
+        /* ★ K11：阻塞着、但**同时**在睡眠链上（带 deadline 的地址等待）★
+         * 到点之前被别人 wake 了，就必须把睡眠链上那一份也摘掉——
+         * 否则 `wake_sleepers` 到点时会再处理它一次，而那时它可能已经在跑
+         * 甚至已经死了（僵尸回收 ⇒ 链上是悬空指针）。这就是"谁改状态谁摘链"
+         * 那条一致性（docs/21 §5.3 的第二行对策）。 */
+        if (t->sleep_armed) {
+            sleep_list_unlink(t);
+        }
         t->state = FE_THREAD_READY;
         rq_push(t);
     } else if (t->state == FE_THREAD_SLEEPING) {

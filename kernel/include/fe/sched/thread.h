@@ -18,6 +18,7 @@
 #include <fe/regs.h>            /* struct fe_fault_regs（K5 的回复槽要用） */
 
 struct fe_task;
+struct fe_address_space;        /* K11：地址等待的键要用它（只存指针）*/
 
 #define FE_THREAD_NAME_MAX     16
 #define FE_THREAD_PRIO_LEVELS  32
@@ -131,6 +132,22 @@ struct fe_thread {
     u32   wait_index;               /* 节点里的第几项被满足了 */
     u32   wait_satisfied;           /* 0 = 没满足；非 0 = 第 (N-1) 项就绪 */
     u32   waiting;                  /* 1 = 已登记进各对象（唤醒者必须先查它） */
+
+    /* ★ K11：等一个用户地址（docs/21-user-address-wait.md）★
+     *
+     * ★ 键为什么放在**线程**上，而不是放在栈上的等待节点里 ★
+     * 唤醒方（`fe_wake_addr`）要比对键才能决定"这个等待者是不是等我这个
+     * 地址的"（微内核里同一个虚拟地址在不同地址空间里是**两个变量**）。
+     * 若键存在等待节点里，唤醒方就要解引用**别人栈上**的结构；存在线程上
+     * 则读的是它自己的字段——与 `waiting` 那套"指针安全性靠关中断 + 标志"
+     * 的纪律一致（见上面那段注释）。 */
+    struct fe_address_space *addr_space;   /* 我正在等的地址属于哪个地址空间 */
+    u64   addr_key;                 /* 我正在等的用户地址（4 字节对齐）*/
+    struct fe_thread *addr_prev;    /* 地址桶里的侵入式双向链 */
+    struct fe_thread *addr_next;
+    u32   addr_waiting;             /* 1 = 在地址桶链上（唤醒方必须先查它）*/
+    u32   wait_timed_out;           /* 1 = 我这一轮等待是**到点**结束的 */
+    u32   sleep_armed;              /* 1 = 我在睡眠链上（sched.c 维护）*/
 
     void *stack_base;
     u64   stack_size;

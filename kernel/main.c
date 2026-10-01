@@ -696,6 +696,10 @@ FE_NORETURN void fe_kmain(void)
     f = fe_selftest_fault();     g_selftest_failures += f;
     fe_kprintf("        => 异常处理者失败项: %u\n", f);
     fe_kprintf("\n");
+    fe_kprintf("[自检] 等一个用户地址（K11：丢唤醒窗口 / 键 / 超时）:\n");
+    f = fe_selftest_wait_addr(); g_selftest_failures += f;
+    fe_kprintf("        => 等待用户地址失败项: %u\n", f);
+    fe_kprintf("\n");
     fe_kprintf("[自检] FPU / SIMD（M10 前置）:\n");
     f = fe_selftest_fpu();       g_selftest_failures += f;
     fe_kprintf("        => FPU 失败项: %u（模式：%s）\n", f,

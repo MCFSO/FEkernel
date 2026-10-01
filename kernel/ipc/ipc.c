@@ -8,6 +8,7 @@
 #include <fe/resource.h>        /* fe_resource_forget_thread_locks（D2① 的锁登记摘除） */
 #include <fe/task.h>            /* fe_task_clear_waiter（wait 的 waiter 槽摘除） */
 #include <fe/user.h>
+#include <fe/time.h>            /* K11：deadline 比的是 K7 的单调纳秒 */
 #include <fe/kprintf.h>
 #include <fe/panic.h>
 #include <fe/string.h>
@@ -533,6 +534,22 @@ fe_status_t fe_endpoint_call(struct fe_task *t, fe_handle_t ep_h,
 /* 多对象等待（wait_any）                                              */
 /* ------------------------------------------------------------------ */
 
+/* ★ 自检钩子（K11 的 W2）：**只给自检用**，生产路径上恒为 NULL ★
+ *
+ * 它在"检查完、还没登记"的那一刻被调用（`fe_wait_any` 的循环里），
+ * 于是自检能把那个丢唤醒窗口**确定性地**造出来。
+ * 实现该放哪、为什么放那里，见调用点的注释。 */
+static void (*g_wait_hook)(struct fe_task *t, const struct fe_wait_target *tg,
+                           u32 n, void *ctx);
+static void *g_wait_hook_ctx;
+
+void fe_wait_any_set_hook(void (*fn)(struct fe_task *, const struct fe_wait_target *,
+                                     u32, void *), void *ctx)
+{
+    g_wait_hook = fn;
+    g_wait_hook_ctx = ctx;
+}
+
 /* 等待节点：一个线程一次等待的**全部信息**。
  * 放在调用者的栈上——它只在这次调用期间有效，而"有效"由 thread->waiting 表达。 */
 struct fe_wait_node {
@@ -558,6 +575,174 @@ static void waiters_add(struct fe_thread **table, struct fe_thread *t)
     /* 表满：不登记，**也不报错**。wait_any 的语义是"任意一个就绪"，
      * 少登记一个目标只是"这个目标这次唤不醒它"，而它与其它目标
      * 共享同一个节点，被别的目标唤醒后照样会重新检查全部目标。 */
+}
+
+/* ------------------------------------------------------------------ */
+/* ★ K11：地址等待队列（键 = (地址空间, 用户地址)）★                   */
+/* ------------------------------------------------------------------ */
+
+/* ★ 为什么是哈希桶 + 侵入式双向链，而不是 `waiters[4]` 那种定长表 ★
+ *
+ * 内核对象上的等待表是定长的（`FE_WAITERS_MAX = 4`），而且**表满静默不登记**
+ * （见上面 waiters_add 的注释）——对"多目标等待"那样做有它的道理。
+ * ★ 但对 futex 语义是致命的 ★ `pthread_cond_wait` 的等待者**必须**真的睡下，
+ * "没登记就睡"= **永久睡死**，而且是"3 条线程过、5 条线程挂"那种形状。
+ * 所以这里给足容量：链无上限，摘除是 O(1)（双向链）。
+ *
+ * ★ 桶的键为什么必须带地址空间 ★ 微内核里没有共享地址空间（除非将来有
+ * fork/CLONE_VM），于是**同一个虚拟地址在两个任务里是两个变量**。
+ * 只用地址做键 ⇒ 跨任务串唤醒：A 改自己的变量，却把 B 的等待者叫醒了。
+ * 只有键完全对上的才唤醒，这一条由自检 W4 用反向堵死。 */
+#define FE_ADDR_BUCKETS 64
+static struct fe_thread *g_addr_wait[FE_ADDR_BUCKETS];
+static u32 g_addr_wait_count;       /* 诊断：当前一共几个等待者 */
+
+static u32 addr_bucket(const struct fe_address_space *sp, u64 addr)
+{
+    /* 地址右移 2 位（4 字节对齐，低两位恒 0）、地址空间指针右移 4 位
+     * （对象对齐），再异或——够散，且不需要随机数。 */
+    u64 h = ((u64)(uptr)sp >> 4) ^ (addr >> 2);
+    return (u32)(h % FE_ADDR_BUCKETS);
+}
+
+/* 调用者必须已关中断。 */
+static void addr_chain_add(struct fe_thread *t, struct fe_address_space *sp, u64 addr)
+{
+    u32 b = addr_bucket(sp, addr);
+    t->addr_space = sp;
+    t->addr_key = addr;
+    t->addr_prev = NULL;
+    t->addr_next = g_addr_wait[b];
+    if (g_addr_wait[b]) {
+        g_addr_wait[b]->addr_prev = t;
+    }
+    g_addr_wait[b] = t;
+    t->addr_waiting = 1;
+    g_addr_wait_count++;
+}
+
+/* 调用者必须已关中断。可以重复调（不在链上时什么都不做）。 */
+static void addr_chain_del(struct fe_thread *t)
+{
+    if (!t || !t->addr_waiting) {
+        return;
+    }
+    u32 b = addr_bucket(t->addr_space, t->addr_key);
+    if (t->addr_prev) {
+        t->addr_prev->addr_next = t->addr_next;
+    } else if (g_addr_wait[b] == t) {
+        g_addr_wait[b] = t->addr_next;
+    } else {
+        /* ★ 链头不是它、它又没有前驱 ⇒ 链被破坏了 ★
+         * 静默走开会让这条链永远带着一个坏节点（那才是难查的形态），
+         * 所以点名之后再线性兜底找一次。 */
+        fe_kprintf("[K11] **地址等待链不一致**：线程 %s(id=%llu) 不在桶 %u 头部"
+                   "却没有前驱——线性兜底\n",
+                   t->name, (unsigned long long)t->id, b);
+        for (struct fe_thread *p = g_addr_wait[b]; p; p = p->addr_next) {
+            if (p->addr_next == t) {
+                p->addr_next = t->addr_next;
+                break;
+            }
+        }
+    }
+    if (t->addr_next) {
+        t->addr_next->addr_prev = t->addr_prev;
+    }
+    t->addr_next = NULL;
+    t->addr_prev = NULL;
+    t->addr_waiting = 0;
+    t->addr_key = 0;
+    t->addr_space = NULL;
+    if (g_addr_wait_count) {
+        g_addr_wait_count--;
+    }
+}
+
+u32 fe_wait_addr_waiters(struct fe_address_space *space, u64 addr)
+{
+    if (!space) {
+        return 0;
+    }
+    u64 irq = fe_irq_save();
+    u32 n = 0;
+    for (struct fe_thread *t = g_addr_wait[addr_bucket(space, addr)]; t;
+         t = t->addr_next) {
+        if (t->addr_waiting && t->addr_space == space && t->addr_key == addr) {
+            n++;
+        }
+    }
+    fe_irq_restore(irq);
+    return n;
+}
+
+/* 只给调度器调：到点了，把线程从地址链上摘掉。状态归调用者。 */
+void fe_wait_addr_on_deadline(struct fe_thread *t)
+{
+    if (!t) {
+        return;
+    }
+    u64 irq = fe_irq_save();
+    addr_chain_del(t);
+    fe_irq_restore(irq);
+}
+
+u32 fe_wake_addr(struct fe_address_space *space, u64 addr, u32 count)
+{
+    if (!space) {
+        return 0;
+    }
+    u64 irq = fe_irq_save();
+    u32 woken = 0;
+    struct fe_thread *t = g_addr_wait[addr_bucket(space, addr)];
+    while (t) {
+        struct fe_thread *next = t->addr_next;      /* 提前取：唤醒可能摘链 */
+        if (t->addr_waiting && t->addr_space == space && t->addr_key == addr) {
+            /* ★ 只在它**真的在睡**时点名 ★
+             * 已经被叫醒过（READY/RUNNING）的线程再叫一次会被
+             * `fe_sched_wake` 按"状态不对"记一行诊断——那是噪声，
+             * 而它本来就在就绪队列里，会自己回去重查。 */
+            if (t->state == FE_THREAD_BLOCKED) {
+                t->wait_satisfied = 1;      /* ★ wait_satisfied 的第一个读者 ★ */
+                fe_sched_wake(t);           /* 顺带摘睡眠链（若带 deadline）*/
+                woken++;
+                if (count != 0 && woken >= count) {
+                    break;
+                }
+            }
+        }
+        t = next;
+    }
+    fe_irq_restore(irq);
+    return woken;
+}
+
+/* 地址目标的一次判定。**必须在关中断区间里调**（这是原子性的一半）。
+ *
+ * 返回：
+ *   FE_OK        值已经不等于期望 ⇒ 立刻返回（不睡）
+ *   FE_ERR_AGAIN 值等于期望 ⇒ 该睡（调用者去登记）
+ *   其余：见 fe/ipc.h */
+static fe_status_t addr_precheck(struct fe_task *t, const struct fe_wait_target *tg)
+{
+    if ((tg->addr & 3u) != 0) {
+        return FE_ERR_INVAL;
+    }
+    /* ★ 内核**永不信任用户指针** ★ 未映射的地址必须是**明确的返回码**，
+     * 不许被当成"值不相等"——后者会让"地址早就 munmap 了"表现为
+     * "条件不满足"，用户态于是永远自旋重试（docs/21 §4.4）。 */
+    if (!fe_user_range_ok(t->space, tg->addr, sizeof(u32), false)) {
+        return FE_ERR_FAULT;
+    }
+    u32 val = 0;
+    memcpy(&val, (const void *)(uptr)tg->addr, sizeof(val));
+    if ((u64)val != (tg->expected & 0xffffffffull)) {
+        return FE_OK;                   /* 值已经变了：不睡 */
+    }
+    if (tg->deadline_ns && fe_time_ns() >= tg->deadline_ns) {
+        return FE_ERR_TIMEOUT;          /* 已经到点了 */
+    }
+    return FE_ERR_AGAIN;
 }
 
 /* 由 send / signal 调用：唤醒所有等在这个对象上的线程。
@@ -666,6 +851,13 @@ static void wait_unregister(struct fe_task *task, struct fe_thread *t,
     u64 irq = fe_irq_save();
     t->waiting = 0;                 /* 先清：之后唤醒方就不会再碰这些表 */
     for (u32 i = 0; i < n; i++) {
+        /* ★ K11：地址键走桶链，不走句柄 ★
+         * 一次等待里只会有一种键（见 fe_wait_any 开头那条校验），
+         * 所以这一支与下面那一支不会同时为真。 */
+        if (node->tgt[i].kind == FE_WAIT_ADDR) {
+            addr_chain_del(t);      /* 摘地址链 */
+            continue;               /* 睡眠链归调度器（wake 路径会摘）*/
+        }
         struct fe_object_header *obj = NULL;
         if (fe_failed(fe_handle_lookup(&task->handles, node->tgt[i].handle, 0, &obj))) {
             continue;
@@ -698,48 +890,115 @@ fe_status_t fe_wait_any(struct fe_task *t, const struct fe_wait_target *targets,
     if (payload_cap > FE_MSG_MAX_PAYLOAD) {
         payload_cap = FE_MSG_MAX_PAYLOAD;
     }
+    /* ★ K11：地址目标必须**独占**一次等待 ★
+     * 它的返回值语义（AGAIN / FAULT / TIMEOUT）与"多目标里任意一个就绪"
+     * 不是一回事；混在一起就要发明一套混合语义，而今天**没有任何调用者
+     * 需要它**（`pthread_cond_wait` 只需要一个地址）。说清楚比含糊地
+     * "支持了但语义不清"好。 */
+    for (u32 i = 0; i < n; i++) {
+        if (targets[i].kind == FE_WAIT_ADDR && n != 1) {
+            return FE_ERR_INVAL;
+        }
+    }
 
     struct fe_wait_node node;
     node.n = n;
     for (u32 i = 0; i < n; i++) {
         node.tgt[i] = targets[i];
     }
+    struct fe_thread *self = fe_thread_current();
+    if (!self) {
+        return FE_ERR_INVAL;
+    }
+    /* ★ "我这一轮睡过没有" —— 它决定"看到值已经变了"该回哪个码 ★
+     * 进门第一次就发现值不等于期望 ⇒ `EAGAIN`（futex 的语义：你给我的
+     * 那个期望值已经不对了，**我没睡**）；被唤醒之后重查才发现 ⇒ `OK`。
+     * 两者对调用者都意味着"回去重查条件"，但对**排查**来说差别很大：
+     * 前者说明"我根本没参与等待"，后者说明"有人叫了我"。 */
+    bool slept_this_wait = false;
 
     for (;;) {
         /* 取消点（K2；2a 起判据换成 fe_thread_should_die）：任务正在被终止、
          * 或**本线程**被单独标记"必须死"时不再等下去。
          * 见 fe_endpoint_recv 里那段说明（局部 `t` 是任务，判据必须取当前线程）。 */
-        if (fe_thread_should_die(fe_thread_current())) {
+        if (fe_thread_should_die(self)) {
             return FE_ERR_CANCELED;
         }
-        /* 1. 先看有没有"已经就绪"的：有就立刻返回，不阻塞。
-         *    这一遍必须在登记**之前**——反过来的话，一个已经就绪的对象
-         *    会先因登记而唤醒我们，然后我们再查一次，白绕一圈。 */
-        memset(res, 0, sizeof(*res));
-        res->reply_ep = FE_HANDLE_INVALID;
-        for (u32 i = 0; i < n; i++) {
-            if (wait_target_ready(t, &node.tgt[i], res, payload_cap, i)) {
+
+        /* ★★ 自检钩子（K11 的 W2；**只给自检用**，生产路径上恒为 NULL）★★
+         *
+         * ★ 它为什么钉在**这一个位置** ★
+         * 它就是"原子区间之前的那一刻"：钩子在这里把条件置真并调一次唤醒，
+         * 等价于"另一个执行体在我要睡下的前一瞬完成了唤醒"。
+         * 区间**没有**包住检查的年代（K11 之前），这一下会漏；
+         * 现在检查在区间里，这一下会被区间内的重查抓到。
+         * 所以同一个钩子既是红测试（修之前红）又是回归判据（修之后绿）。 */
+        if (g_wait_hook) {
+            g_wait_hook(t, node.tgt, n, g_wait_hook_ctx);
+        }
+
+        /* ★★ K11 §3.4：区间从**检查之前**开始 ★★
+         *
+         * 原先"先看有没有已经就绪的"在区间**外**（它与区间之间夹着
+         * `wait_target_ready` 的全部工作、`FE_WAIT_MSG` 分支里甚至有一次
+         * 最多 1024 字节的 `memcpy`）。落在那段里的"条件变真 + 唤醒"会丢，
+         * 而本函数上面那句注释逐字写着这条不变式——**代码与注释不一致**，
+         * 这就是 W2 修之前红的原因（`build/k11-w2-red.txt` 是它的原文）。
+         *
+         * 现在"检查 → 登记 → 置 BLOCKED"全在同一个区间里，
+         * 于是唤醒方只有两种可能：区间**之前**来（那时条件已经变了，
+         * 区间内的重查会看见）或者区间**之后**来（那时登记已经在表上，
+         * 唤醒方找得到我们）。**中间那一种不存在了。** */
+        u64 flags = fe_irq_save();
+
+        if (node.tgt[0].kind == FE_WAIT_ADDR) {
+            /* 地址目标：它决定"睡不睡"，而不是"就绪没就绪" */
+            fe_status_t a = addr_precheck(t, &node.tgt[0]);
+            if (a == FE_OK) {
+                fe_irq_restore(flags);
+                return slept_this_wait ? FE_OK : FE_ERR_AGAIN;
+            }
+            if (a != FE_ERR_AGAIN) {
+                fe_irq_restore(flags);
+                return a;               /* FAULT / TIMEOUT / INVAL */
+            }
+        } else {
+            /* 1. 先看有没有"已经就绪"的：有就立刻返回，不阻塞。
+             *    这一遍必须在登记**之前**——反过来的话，一个已经就绪的对象
+             *    会先因登记而唤醒我们，然后我们再查一次，白绕一圈。 */
+            memset(res, 0, sizeof(*res));
+            res->reply_ep = FE_HANDLE_INVALID;
+            bool ready = false;
+            for (u32 i = 0; i < n; i++) {
+                if (wait_target_ready(t, &node.tgt[i], res, payload_cap, i)) {
+                    ready = true;
+                    break;
+                }
+            }
+            if (ready) {
+                fe_irq_restore(flags);
                 return FE_OK;
             }
         }
 
-        /* 2. 都不就绪：登记到每个对象上，然后阻塞。
-         *
-         * ★ 登记与"再次检查"必须在同一个关中断区间里 ★
-         * 否则会丢唤醒：检查完发现没就绪、刚要登记，对方在这一刻置位
-         * 并发现"没人等"，于是我们睡下去没人叫。这是等待-唤醒类机制
-         * 最经典的 bug，这里用"同一个关中断区间"把它堵死。
+        /* 2. 都不就绪：登记到每个对象上（地址则登记进桶链），然后阻塞。
          *
          * 顺序也有讲究：**先把指针写进对象、最后置 waiting**。
          * 唤醒方查 waiting 为真才碰指针，所以只要 waiting 是最后置的，
          * 就不存在"指针已写入但唤醒方看不到"的窗口；
          * 反过来会出现"唤醒方以为指针有效、实际还没写"的窗口。 */
-        u64 flags = fe_irq_save();
-        struct fe_thread *self = fe_thread_current();
         for (u32 i = 0; i < n; i++) {
+            if (node.tgt[i].kind == FE_WAIT_ADDR) {
+                addr_chain_add(self, t->space, node.tgt[i].addr);
+                /* ★ 顺手挂睡眠链（deadline == 0 时它什么都不做）★
+                 * 两条链、一个状态：见 docs/21 §5.3 与 fe_sched_sleep_arm。 */
+                fe_sched_sleep_arm(node.tgt[i].deadline_ns);
+                continue;
+            }
             struct fe_object_header *obj = NULL;
             if (fe_failed(fe_handle_lookup(&t->handles, node.tgt[i].handle, 0, &obj))) {
                 fe_irq_restore(flags);
+                wait_unregister(t, self, &node, n);
                 return FE_ERR_BADHANDLE;
             }
             if (node.tgt[i].kind == FE_WAIT_MSG && obj->type == FE_OBJ_ENDPOINT) {
@@ -755,17 +1014,58 @@ fe_status_t fe_wait_any(struct fe_task *t, const struct fe_wait_target *targets,
         }
         self->wait_node = &node;
         self->wait_satisfied = 0;
-        self->waiting = 1;              /* ★ 最后置它 ★ */
+        self->wait_timed_out = 0;
+        self->waiting = 1;
+        /* ★★ K11 §3.4 ②：置 BLOCKED 也在这个区间里 ★★
+         * 于是"已登记"与"能被唤醒"**同时**成立——原先把这一句留给
+         * 区间之外的 `fe_sched_block_current()`，中间那几微秒里到达的唤醒
+         * 会被 `fe_sched_wake` 按"状态不对"丢弃（它只接受 BLOCKED/SLEEPING），
+         * 而本函数随后又把线程压回 BLOCKED ⇒ 那次唤醒白叫了。 */
+        self->state = FE_THREAD_BLOCKED;
+        slept_this_wait = true;         /* 这一轮之后"值变了"就不再是 EAGAIN */
         fe_irq_restore(flags);
 
+        /* ★ §3.4 ③：`fe_sched_block_current` 现在是幂等的 ★
+         * 唤醒若抢在前面把它置成 READY，这里**不会**再压回 BLOCKED。 */
         fe_sched_block_current();
 
-        /* 被唤醒后回到循环顶部：**重新检查全部目标**。
+        wait_unregister(t, fe_thread_current(), &node, n);
+
+        if (self->wait_timed_out) {
+            self->wait_timed_out = 0;
+            return FE_ERR_TIMEOUT;
+        }
+        if (node.tgt[0].kind == FE_WAIT_ADDR) {
+            /* ★ futex 契约：被唤醒就回"有人叫了你"，**由调用者重查** ★
+             * 这里刻意**不**重查再判 AGAIN：被 broadcast 波及的等待者
+             * 醒来时值可能还没变，而标准要求它醒来后自己重查条件——
+             * 把"没变"翻译成失败会把正常的 broadcast 变成错误。 */
+            if (self->wait_satisfied) {
+                return FE_OK;
+            }
+            continue;               /* 既没超时也没被满足：回去重查 */
+        }
+        /* 对象目标：回到循环顶部**重新检查全部目标**。
          * 不假设"唤醒我的就是就绪的那个"——唤醒方只知道"这个对象动了"，
          * 而通知的位可能已经被同一任务的另一个线程取走。
          * 重新检查是关键，它让"伪唤醒"自动变成正确行为。 */
-        wait_unregister(t, fe_thread_current(), &node, n);
     }
+}
+
+/* ★ K11 的对外入口：等一个用户地址 ★ */
+fe_status_t fe_wait_addr(struct fe_task *t, u64 addr, u64 expected, u64 deadline_ns)
+{
+    if (!t) {
+        return FE_ERR_INVAL;
+    }
+    struct fe_wait_target tg;
+    memset(&tg, 0, sizeof(tg));
+    tg.kind = FE_WAIT_ADDR;
+    tg.addr = addr;
+    tg.expected = expected;
+    tg.deadline_ns = deadline_ns;
+    struct fe_wait_result res;
+    return fe_wait_any(t, &tg, 1, &res, 0);
 }
 
 /* ------------------------------------------------------------------ */
