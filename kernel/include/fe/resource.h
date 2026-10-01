@@ -134,6 +134,29 @@ void fe_resource_dump(void);
  * 区间不属于共享条目（或根本不在池子里）时返回 NULL。 */
 struct fe_thread;
 struct fe_thread *fe_resource_lock_holder(u32 kind, u64 base, u64 len);
+/* 同上，读"谁在等这把锁"。D2① 的第二个正向断言要用它把
+ * "死者占着 lock_waiter"读成一个可读的事实（只比指针、不解引用）。 */
+struct fe_thread *fe_resource_lock_waiter(u32 kind, u64 base, u64 len);
+
+/* ★ 放掉"某个线程"握着的共享区间控制器锁，并唤醒该锁的等待者 ★
+ *
+ * 用在**杀一个线程之前**（`fe_task_kill_other_threads` 的循环里）。
+ * 为什么必须有它：`lock_forget_owner` 只在**任务销毁**与资源转交时跑，
+ * 而 `exec` 杀完线程之后**任务还活着** ⇒ 被杀线程握着的那把锁再也不会
+ * 被放掉：后来者一直等在 `fe_resource_lock` 上，而僵尸被回收之后
+ * `lock_holder` 还指着它（`lock_forget_owner` 会读
+ * `e->lock_holder->task->id`——那是一次 use-after-free）。
+ *
+ * ★ 判据是**线程指针**，不是 `owner_id` ★
+ * 按 `owner_id` 匹配会顺手放掉**调用者自己**（同一个任务）握着的锁——
+ * 那正好是 D4 反向对照①要证伪的形态。所以这里逐个条目比较
+ * `e->lock_holder == t`，与"谁的任务"无关。
+ *
+ * 顺序：**先放锁、再让它死**（docs/13-tasks-and-kill.md §6.2 第 2 条）。
+ * 反过来的话，锁会在"持锁者已死、锁还没放"之间留下一个窗口，
+ * 而这段时间里后来者会把自己登记成 waiter 然后阻塞——那个登记随后
+ * 又要靠别人来摘。 */
+void fe_resource_forget_thread_locks(struct fe_thread *t);
 
 /* 自检：返回失败项数（0 = 全部通过） */
 u32 fe_selftest_resource(void);

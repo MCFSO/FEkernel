@@ -392,6 +392,26 @@ fe_status_t fe_process_wait(struct fe_task *parent, fe_handle_t task_handle,
      * 否则「检查完发现没退出，正准备阻塞」与「对方刚好在这一刻退出并唤醒」
      * 会互相错过，调用者就永远睡下去了。 */
     for (;;) {
+        /* ★ D2②：取消点——判据与闸门、与另外两个取消点**共用一个函数** ★
+         *
+         * ★ 不修的症状（实测）★ 被标记的线程被叫醒之后回到这个循环顶，
+         * 而这里只看 `child->exited` ⇒ 条件仍不成立 ⇒ **重新登记再阻塞**：
+         * 状态从 BLOCKED 回到 BLOCKED，永远不会 DEAD。
+         * 实测：`**D2② 缺陷**：等待者已 DEAD=1，但 fe_process_wait 永远
+         * 没有返回（done=0 status=0，期望 -21）`。
+         *
+         * ★ 为什么这一处是**最常见**的形态 ★
+         * "拉起子进程再等它"是任何服务线程都长这样的一段代码。子进程永远
+         * 不退出（或者它自己也正卡在别处）时，父线程就杀不掉——而
+         * `exec` 要杀的正是这种线程。
+         *
+         * ★ 判据必须从**当前线程**取，不能从任务取 ★
+         * 这个函数的局部变量 `t` 是**任务**（`struct fe_task *child` 也是）。
+         * 按任务判会得到"任务没在终止 ⇒ 不取消"（取消点静默失效），
+         * 或者更糟：把"我在等的那件事没了"当成"我该死了"。 */
+        if (fe_thread_should_die(fe_thread_current())) {
+            return FE_ERR_CANCELED;
+        }
         u64 flags = fe_irq_save();
         if (child->exited) {
             i32 code = child->exit_code;

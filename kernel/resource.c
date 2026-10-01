@@ -378,6 +378,61 @@ static void lock_forget_owner(struct fe_res_entry *e, u64 owner_id)
     }
 }
 
+/* ★ 放掉"某个线程"握着的锁 + 摘掉"某个线程"留下的等待登记（D2①/D4）★
+ *
+ * ★ 为什么按**线程**匹配，而不是像 lock_forget_owner 那样按 owner_id ★
+ * `lock_forget_owner` 判的是"这把锁的持有者属于哪个任务"，因为它服务的是
+ * "整个任务消失了"这件事。而这里的调用者是 `exec`/`fe_task_terminate`
+ * 那条"杀掉**指定线程**、任务继续活着"的路：按 owner_id 匹配会把**调用者
+ * 自己**（同一个任务）握着的锁一起放掉——那正好是 D4 反向对照①要证伪的
+ * 形态。所以判据只有一个：`e->lock_holder == t`。
+ *
+ * ★ 为什么还要顺手清 `lock_waiter`（D2① 的另一半）★
+ * `fe_thread_cancel` 把被标记的等待者叫醒之后，只有取消点能让它不再回来。
+ * 但它那一次 `fe_resource_lock` **已经在槽里留了登记**（`e->lock_waiter = self`），
+ * 取消点生效时那个登记没人摘——受害者随后返回 CANCELED、走闸门、死、
+ * 僵尸被回收，而这个槽还指着它：
+ *   - 下一次 `fe_resource_unlock` 会把已释放的内存当线程去 `fe_sched_wake`
+ *     （读 `t->state`）——use-after-free；
+ *   - 而**真正该被唤醒的那个**后来者永远拿不到锁。
+ * 实测（D2① 缺陷期）：`正常放锁之后等待者没有拿到锁（holder=0x0 期望
+ * 0xffffffffa0003c40，c 状态=4）`——c 一直 BLOCKED，因为解锁唤醒的是
+ * 那个已经死掉的登记。
+ *
+ * ★ 顺序：先摘等待登记、再放锁、最后唤醒 ★
+ * 放锁之前必须先把陈旧登记摘掉，否则 `fe_sched_wake` 会去唤醒一个
+ * 不该醒的人（见上）。唤醒放在最后，且改成唤醒**当前登记的那个**。 */
+void fe_resource_forget_thread_locks(struct fe_thread *t)
+{
+    if (!t) {
+        return;
+    }
+    for (u32 i = 0; i < FE_RES_MAX; i++) {
+        struct fe_res_entry *e = &g_pool[i];
+        if (!(e->flags & FE_RES_FLAG_SHARED)) {
+            continue;
+        }
+        struct fe_thread *wake = NULL;
+        u64 flags = fe_irq_save();
+        /* ① 它留下的等待登记：清掉，别让已经死的人继续占着"下一个能拿锁"的位置 */
+        if (e->lock_waiter == t) {
+            e->lock_waiter = NULL;
+        }
+        /* ② 它握着的锁：放掉，并把机会交给当前登记的等待者 */
+        if (e->lock_holder == t) {
+            e->lock_holder = NULL;
+            wake = e->lock_waiter;
+            if (wake) {
+                e->lock_waiter = NULL;
+            }
+        }
+        fe_irq_restore(flags);
+        if (wake) {
+            fe_sched_wake(wake);
+        }
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /* 设备管理器能力                                                      */
 /* ------------------------------------------------------------------ */
@@ -566,6 +621,28 @@ fe_status_t fe_resource_lock(u32 kind, u64 base, u64 len, u64 owner_id)
     }
 
     for (;;) {
+        /* ★ D2①：取消点——判据与闸门、与另外两个取消点**共用一个函数** ★
+         *
+         * ★ 不修的症状（实测）★ 被标记的线程被 `fe_thread_cancel` 叫醒之后
+         * 回到这个循环顶，而这里只看"锁在不在"⇒ 条件仍不成立 ⇒
+         * **重新登记再阻塞**：状态从 BLOCKED 回到 BLOCKED，永远不会 DEAD。
+         * 实测：`**D2① 缺陷**：受害者已 DEAD=1，但它那次 fe_resource_lock
+         * 永远没有返回（done=0）`——等一下，那时它 DEAD 是因为别处把它
+         * 判死了，而这次调用**永远不返回**，于是 `lock_waiter` 那个槽
+         * 一直留着它的指针（僵尸回收之后就是悬空）。
+         *
+         * ★ 为什么判据必须是 `fe_thread_should_die(fe_thread_current())` ★
+         * 两件事一起判：本线程被单独标记（`kill_pending`）**或**所属任务
+         * 正在终止（`task->dying`）。写成 `t->kill_pending` 而 `t` 是任务，
+         * 或者只判任务级，都会让取消点静默失效（见
+         * docs/13-tasks-and-kill.md §6.3 开头那条坑）。
+         *
+         * ★ 返回值是 FE_ERR_CANCELED，不是 FE_ERR_BUSY ★
+         * 调用者据此知道"不是锁出了问题，是我被取消了"——它随后返回用户态，
+         * 途中经过 `fe_sched_maybe_switch` 的闸门，在那里真正死掉。 */
+        if (fe_thread_should_die(self)) {
+            return FE_ERR_CANCELED;
+        }
         u64 flags = fe_irq_save();
         if (!e->lock_holder) {
             e->lock_holder = self;
@@ -622,6 +699,18 @@ struct fe_thread *fe_resource_lock_holder(u32 kind, u64 base, u64 len)
 {
     struct fe_res_entry *e = shared_entry_find(kind, base, len);
     return e ? e->lock_holder : NULL;
+}
+
+/* 同上，但读的是"谁在等这把锁"。
+ *
+ * ★ 为什么它也必须存在（D2① 的第二个正向断言要用它）★
+ * "死者占着 `lock_waiter`"这条症状是一个**可读的事实**，而它只能从池子里
+ * 读出来。断言必须比指针、不解引用（死者随时可能被回收），而"读到死者的
+ * 指针"本身就是判据。它只看不写、不唤醒任何人。 */
+struct fe_thread *fe_resource_lock_waiter(u32 kind, u64 base, u64 len)
+{
+    struct fe_res_entry *e = shared_entry_find(kind, base, len);
+    return e ? e->lock_waiter : NULL;
 }
 
 /* ------------------------------------------------------------------ */
@@ -872,7 +961,34 @@ static u32 selftest_d2_reslock(void)
                 fe_kprintf("        D2① 反向对照：另一个任务里没被标记的锁等待者"
                            "仍 BLOCKED\n");
             }
-            /* 正常放锁：等待者必须能拿到（证明取消判据没有打掉正常获取路径）。 */
+            /* ★ 第二个正向断言：死者占着 `lock_waiter` ★
+             *
+             * 原来这一条写成"反向对照"，而它在缺陷期与主断言**一起红**——
+             * 那就不是反向对照（反向对照的职责是"必须不变"），它是**同一条
+             * 缺陷的第二个症状**，措辞按这个如实改。
+             *
+             * 症状说得清：`fe_resource_lock` 没有取消点 ⇒ 被叫醒的受害者
+             * 回到循环顶、条件仍不成立 ⇒ **重新登记再阻塞** ⇒ 它那次调用
+             * 永远不返回 ⇒ `e->lock_waiter` 一直写着它。受害者随后死在闸门上，
+             * 僵尸被回收，这个槽就成了悬空指针。
+             *
+             * ★ 判据只比指针、不解引用 ★ 所以"读到死者的指针"本身是安全
+             * 可观察的（与 D1 同一条纪律）。 */
+            struct fe_thread *lw = fe_resource_lock_waiter(FE_RES_IOPORT, 0x70, 4);
+            CHECK(lw != b);
+            if (lw == b) {
+                fe_kprintf("        **D2① 失败（第二个症状）**：死者的 lock_waiter "
+                           "登记没被摘（lock_waiter=%p == 受害者 %p）——"
+                           "它那次 fe_resource_lock 永远不返回，僵尸回收之后"
+                           "这个槽就是悬空指针\n", (void *)lw, (void *)b);
+                fail++;
+            } else {
+                fe_kprintf("        D2① 修复后：死者的 lock_waiter 登记已摘"
+                           "（lock_waiter=%p）\n", (void *)lw);
+            }
+            /* 正常放锁：等待者必须能拿到（证明取消判据没有打掉正常获取路径）。
+             * ★ 这一条同时是上面那个症状的**目的**：死者占着登记时，
+             * 解锁唤醒的是它，真正该拿锁的 c 就永远拿不到。★ */
             CHECK(fe_ok(fe_resource_unlock(FE_RES_IOPORT, 0x70, 4, 0)));
             struct fe_thread *took = NULL;
             for (u32 i = 0; i < 200 && !took; i++) {
@@ -881,12 +997,13 @@ static u32 selftest_d2_reslock(void)
             }
             CHECK(took == c);
             if (took != c) {
-                fe_kprintf("        **D2① 反向对照失效**：正常放锁之后等待者"
-                           "没有拿到锁（holder=%p 期望 %p，c 状态=%u）\n",
+                fe_kprintf("        **D2① 失败（第二个症状的后果）**：正常放锁之后"
+                           "等待者没有拿到锁（holder=%p 期望 %p，c 状态=%u）——"
+                           "解锁唤醒的是死者留下的那个陈旧登记\n",
                            (void *)took, (void *)c, c ? c->state : 0);
                 fail++;
             } else {
-                fe_kprintf("        D2① 反向对照：正常放锁之后等待者拿到了锁"
+                fe_kprintf("        D2① 修复后：正常放锁之后等待者拿到了锁"
                            "（正常路径没被打掉）\n");
             }
         }

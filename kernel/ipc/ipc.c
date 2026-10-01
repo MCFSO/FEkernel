@@ -5,6 +5,7 @@
 #include <fe/mm/vmm.h>
 #include <fe/sched/sched.h>
 #include <fe/sched/thread.h>
+#include <fe/resource.h>        /* fe_resource_forget_thread_locks（D2① 的锁登记摘除） */
 #include <fe/user.h>
 #include <fe/kprintf.h>
 #include <fe/panic.h>
@@ -794,6 +795,19 @@ void fe_thread_cancel(struct fe_task *task, struct fe_thread *victim)
             }
         }
     }
+    /* 路径 4：共享区间控制器锁上的等待登记（D2① 的另一半）。
+     *
+     * ★ 为什么它不在上面那趟句柄表扫描里 ★
+     * 锁不是句柄对象——它挂在**资源池条目**上（`resource.c` 的 g_pool，
+     * 对 ipc.c 不可见）。所以这一条走 `fe_resource_forget_thread_locks`，
+     * 由资源池自己去扫它的条目。放在这里（同一个关中断区间里、唤醒之前）
+     * 是为了让"摘登记"这一步与另外三条一样是**先做后唤醒**。
+     *
+     * ★ 不清它的后果（实测，见 D2① 的第二个正向断言）★
+     * `e->lock_waiter` 留着已经死掉/即将被回收的线程 ⇒
+     *   1. 真正该被唤醒的后来者永远拿不到锁（解锁唤醒的是这个陈旧登记）；
+     *   2. 僵尸回收之后 `fe_sched_wake` 读的是已释放内存。 */
+    fe_resource_forget_thread_locks(victim);
     fe_irq_restore(flags);
 
     /* 唤醒放在关中断区间之外：fe_sched_wake 自己会关中断，
