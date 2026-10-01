@@ -85,7 +85,124 @@
 | K9 | ~~用户态 TLS 基址~~ | **已完成**（见 §3 末尾的自检证据） | — |
 | ~~★ C2 缺项~~ | ~~**`mprotect`**（区间属性变更）~~ ✅ **已完成（commit `bbd4184`）**：`fe_vmm_protect`（页表层，改 `W`/`NX` 位并**无条件 `invlpg`**）→ `fe_vma_protect_range`（机制层）→ `sys_mem_protect`（syscall **0x91**，`FE_SYS_MAX` → `0x92`）→ 用户态 `fe_mem_protect`（`libfe.c:142`）。新自检组 `fe_selftest_protect_range`（`vma.c:563`，挂 `main.c:633`）：正向（3 页 PTE 的 W 位掉了、NX 在、**帧没换**、USER 在、VMA 的 ANON 保留）+ **四条反向对照**（邻居不受影响 / 六种越界与跨区间被拒且拒绝后权限零变化 / 另一个任务只影响它自己 / 同时要 `W` 与 `X` 的组合被拒，而 `R`+`X`、`R`+`W` 各自合法）。★ 它是**先红后绿**验的：把 `fe_vmm_protect` 临时改成提前返回（= "只改 VMA、不改 PTE"的缺陷版）→ `区间保护失败项: 7`；恢复 → `0` ★ | 挡过的三件事：libc++ 启动时把 `.data.rel.ro` **降权成只读**（RELRO）、分配器"大块还回去"、**Qt QML/V4 的 JIT**（"先写后执行"必须两次属性变更，而内核是 W^X）。见 `16-selfhost-path.md` §2.3 与 `17-libcxx-build.md` §2.9 | 中偏大，已付：VMA 与 PTE **同时**改（只改一处都有坏结局）；边界 = 范围必须**完全落在同一个 VMA 内** + **W^X**（`vma.c:242-284`）。既有判据零退化：**24 条汇总行全 0**（原 23 + 新增"区间保护"），panic=0 |
 | **K11** | **"等一个用户地址"的等待原语**（futex 语义：原子地"检查用户内存的值 + 入队睡眠"） | ★ **谁在等它** ★ `pthread_cond_wait` / `std::condition_variable` / `std::mutex` 的公平唤醒；`16-selfhost-path.md` §4 的 **S3（线程与同步）** 把它列为**硬前置**；libc++ 的线程支持**全有或全无**（`17-libcxx-build.md` §7.1），所以"要线程就得先有它"；而 **QEMU 默认 `-smp 1`，自旋在单核上不是慢而是锁死**（`16` §2.3） | 中：一条**新的等待对象类型**（用户地址），要接进 K4 的等待节点机制并处理丢唤醒窗口；两条候选出路与各自代价见 `17` §2.6 |
-| ★ 小缺口 | **（1）`strncmp` 只声明、没有实现**：`user/include/fe_user.h:883` 与 `user/include/posix/string.h:25` 都声明它，`user/libposix/stdlib.c:224` 还**在用**它，而**全仓没有任何定义** —— 一链接就是 `undefined symbol`（`user/bin/faulttest/main.c:147` 的注释记着这件事）。附带一句**过时的话**：`user/libposix/string.c:6` 说"`strchr`/`strrchr`/`strncmp` 已经在 libfe 里实现过一份"，实测 libfe 里**没有**。**（2）一处注释与事实不符**：`user/bin/exectest/main.c:103` 写"用户态今天没有 errno 头"，而 `user/include/fe_user.h:43` 从**初始提交**（`8beffe5`）起就 `#include <fe/errno.h>`，`tools/build.py:117-118` 也把 `kernel/include` 加进了 `INCLUDES` —— **`FE_ERR_*` 在用户态是可用的**（`user/bin/blkbench/main.c:378`、`clocktest/main.c:168`、`devmgr/main.c:119-126` 都是在**代码**里直接用）。 | 都不影响今天的构建（没有实际代码路径去调用那个链接不到的 `strncmp`），但**下一个人会照着注释做错事**：所以按"文档跟着事实走"记在这里，**不改代码** | 小 |
+| ★ 小缺口 | ★★ **"声明了却没有实现"的系统性审计（2026-10-02）：还有 3 类、共 18 条** ★★ 逐条见下面的审计块（每条带 `文件:行号` 与严重度）。**本行原先只记了 2 条**（`strncmp` 与一处 errno 注释）——**那 2 条都还成立，而且第 1 条比原先写的更广**；那一轮之后又抓到 **`thread->wait_satisfied` 只写不读**，于是做了这次全量审计——<br>★ 三类的条数 ★ ① 内核头声明、全仓无定义 **2** 条；② 用户态"声明 + 被调用 + 用户态无定义" **6 个函数**（`strncmp`/`strchr`/`strcpy`/`strncpy`/`strcat`/`strncat`）+ **1 条过时注释** = 7 条；③ 结构体 **写 0 读 0 的死字段 2 个** + **只写不读 2 个** = 4 条（另有 4 个同族的诊断计数器，记为上下文、不建议动）。**2 + 7 + 4 = 13 条清单项**，外加 4 个诊断计数器与 1 条结构性结论，实际写下来 **18 条**。 | 见审计块"严重度"列。★ 但最要紧的不是任何单条，而是那个**结构性事实**：`--gc-sections` 按**节**回收（`tools/build.py:322-333`），一个"坏死函数"只要**没有任何 .o 需要保留它所在的节**就不进最终链接——于是 **`undefined symbol` 根本不会发生，构建照样全绿**。所以 **"构建是绿的"证明不了"每个声称可用的函数真的可用"**；今天所有 user 程序都链接成功，而 `strncmp`/`strchr` 确实是缺失的 ★ | 全部**不影响今天的构建**（没有代码路径走到那些函数），但**下一个人会踩**：他在 `getenv` 或 `strspn`/`strcspn` 附近加一行，就会拿到一个 `undefined symbol`。所以按"文档跟着事实走"记全，**修复单列，本轮不改任何代码** |
+
+#### ★ 审计（2026-10-02）："声明了却没有实现"的三类清单 ★
+
+★ 方法可复现，判据写在每类下面；**每条都给 `文件:行号`** ★
+本轮**不修**：修复是下一刀的事，而且 `user/libposix` 正被另一个代理改着。
+
+**用到的判据（可复现）**
+1. **抽声明**：遍历 `kernel/include/**/*.h` 与 `user/include/**/*.h`，
+   取形如 `<返回类型> <名字>(<参数>);` 的整行（排除 `typedef`、结构体字段、
+   以及 `{}` 里的内联函数体——后者是**定义**，不是声明）。
+2. **找定义**：在 `kernel/**` 与 `user/**` 的 `*.c`/`*.asm` 里找
+   "名字 + 配对括号 + `{`"（跨行安全），`.asm` 里找 `global <名字>` 或 `<名字>:`。
+3. **★ 关键的一步：区分"全仓无定义"与"只有内核侧有定义" ★**
+   用户态要用的符号如果**只在 `kernel/lib/string.c` 里**有定义，
+   它**不算有实现**——用户态链接不到内核。这一条是本轮最容易被漏掉的判据，
+   也正是 `strncmp` 那一族（7 个里的 6 个）藏身的地方。
+4. **结构体字段**：剥掉注释后，按 `\->字段` / `\.字段` 统计**写**（后面跟
+   `=` / `++` / `--` / `+=` 等）与**读**（其余）。**读 0 写 0 = 完全死字段；
+   写 >0 读 0 = 只写不读。** ★ 噪音要手工排掉 ★：局部变量、同名字段、
+   以及 `t->granted_ports` 这种"读了但只用于填另一张表"的间接读者。
+5. **★ 反向核对（防"我数错了"）★**：对每条候选，用 `llvm-nm` 看真实目标文件——
+   `build/user/**/*.elf` 里有没有那个符号（证明它到底进没进链接），
+   以及 `.o` 里的 `U` 列表（证明"谁在引用它"）。
+
+**① 内核侧：头文件里声明、全仓没有任何定义（2 条）**
+
+| # | 符号 | 声明处 | 全仓引用数 | 严重度 |
+|---|---|---|---|---|
+| 1 | `fe_fault_cr2` | `kernel/include/fe/user.h:112` | ★ **0**（连定义与调用都没有）★ | **只是死声明** |
+| 2 | `fe_fault_error` | `kernel/include/fe/user.h:113` | ★ **0** ★ | **只是死声明** |
+
+★ 这两条为什么不危险、但必须记 ★ 真实路径走的是**另一条**：
+`fe_read_cr2()`（`kernel/include/fe/io.h:86` 的 `FE_INLINE`）+ 现场的
+`r->error`，都在 `idt.c:313`（`u64 cr2 = (r->vector == 14u) ? fe_read_cr2() : 0;`）
+与 `idt.c:347`（`fe_user_resolve_fault(task, cr2, r->error)`）。
+所以 `fe_fault_cr2`/`fe_fault_error` 是**当初预留、后来没走那条路**留下的空声明——
+**谁把它们当接口去调，就会在链接期得到 `undefined symbol`。**
+（本轮修过的 MSI-X 那一族是同一形状：**文档/门面与实现不一致**。）
+
+**② 用户态：声明 + 被调用 + 全仓无定义（7 个符号）**
+
+★ 这一类的判据是第 3 条：**内核里有定义不算** ★
+`kernel/lib/string.c` 把这 6 个（除 `strncat`）**全都实现了**
+（`:124` `strcpy`、`:132` `strncpy`、`:144` `strchr`、`:156` `strrchr`、
+`:189` `strcat`、`:111` `strncmp`），**用户态一个都没有**。
+
+| # | 符号 | 声明处 | 谁在引用（会被炸的位置） | 严重度 |
+|---|---|---|---|---|
+| 1 | `strncmp` | `user/include/fe_user.h:883`、`user/include/posix/string.h:25` | `user/libposix/stdlib.c:224`（在 `getenv` 里） | ★★ **一用就炸** ★★ |
+| 2 | `strchr` | `user/include/fe_user.h:888`、`user/include/posix/string.h:27` | `user/libposix/string.c:86`/`:97`/`:107`（`strspn`/`strcspn`/`strtok_r` 一族）、`user/libposix/stdlib.c:240`（在 `setenv` 里） | ★★ **一用就炸**（引用方**已在 `.o` 里**，见下面那条机制） ★★ |
+| 3 | `strcpy` | `user/include/fe_user.h:884`、`user/include/posix/string.h:20` | 本轮全仓搜**无调用者** | 只是死声明 |
+| 4 | `strncpy` | `user/include/fe_user.h:885`、`user/include/posix/string.h:21` | 无调用者 | 只是死声明 |
+| 5 | `strcat` | `user/include/fe_user.h:886`、`user/include/posix/string.h:22` | 无调用者 | 只是死声明 |
+| 6 | `strncat` | `user/include/fe_user.h:887`、`user/include/posix/string.h:23` | ★ **无调用者，而且连内核侧都没有** ★（`kernel/lib/string.c` 也没有它） | 只是死声明（但它是**唯一一个"两头都没有"**的） |
+| 7 | `user/libposix/string.c:5-7` 的**过时注释** | `user/libposix/string.c:5-7` 逐字："memcpy/memset/memcmp/strlen/strcmp/strcpy/strncpy/strcat/strncat/strchr/strrchr/strncmp **已经在 libfe 里实现过一份**" | ★ **实测 libfe 只实现了 5 个**：`llvm-nm` 在 `build/obj/user/user/libfe/libfe.c.o` 里只看到 `memcmp`/`memcpy`/`memset`/`strcmp`/`strlen` ★ | ★ **可疑（这是"注释骗人"）** ★ |
+
+★★ **为什么 `strncmp`/`strchr` 今天没把构建打红——机制在这里** ★★
+不是"没人写那行代码"这么简单。真实机制是**按节回收 + 按节解析**：
+- 编译带 `-ffunction-sections`（`tools/build.py:113-114`），每个函数一个节；
+- 链接带 `--gc-sections`（`tools/build.py:341`），**没有任何 .o 需要保留的节会被整个丢掉**；
+- 于是当 `string.c.o` 因为 `memmove` 被拉进来时，**只有 `.text.memmove` 与
+  `.text.strerror` 留下**（实测：`ps.elf`/`sh.elf`/`hello.elf` 里
+  `user/libposix/string.c` 只贡献了 `memmove` 与 `strerror` 两个符号）——
+  引用 `strchr` 的 `strspn`/`strcspn`/`strtok_r` 那些节**不在最终映像里**，
+  所以 `ld.lld` 根本不需要解析 `strchr`；
+- 但 `stdlib.c.o` 不一样：它的 `.text.getenv` 与 `.text.setenv` **一旦被保留**，
+  引用就**必须**解析。所以 `strncmp` 是"**只要有人调 `getenv` 就红**"。
+
+★ 这条机制值得单独记住 ★ 它意味着**"构建全绿"与"接口可用"之间没有因果关系**：
+`strncmp` 的 `undefined symbol` 不是不会发生，而是**被 `--gc-sections` 推迟到了
+第一次真正使用它的那一刻**——而那正是别人照着我们的头文件写新代码的时候。
+
+**③ 结构体字段：只写不读 / 完全死字段（4 个 + 4 个诊断计数器）**
+
+| # | 字段 | 声明处 | 实测（剥注释后的读写） | 严重度 |
+|---|---|---|---|---|
+| 1 | `fe_thread.wait_index` | `kernel/include/fe/sched/thread.h:132`（注释："节点里的第几项被满足了"） | ★ **写 0、读 0** ★ 全仓只有这一行声明 | ★ **完全死字段** ★ |
+| 2 | `fd_entry.shared` | `user/libposix/posix.c:71` | ★ **写 0、读 0** ★（`fd_shared` 全仓只有声明，没有任何分配） | ★ **完全死字段**；★ 而且它**不是一个无害的死字段**：它背后的 `dup` 共享偏移语义是**标准要求**，`20` §6 第 13 条已单列为待办 ★ |
+| 3 | `fe_task.killed_threads` | `kernel/include/fe/task.h:79` | 写 1（`kernel/task/process.c:891`，在 `fe_task_kill_threads` 一族里）、**读 0** | 只写不读（注释自称"诊断用"，但**没有任何诊断读它**） |
+| 4 | `fe_task.fault_count_total` | `kernel/include/fe/task.h:115` | 写 1（`kernel/task/fault.c:412`，在 `fault_fill_regs` 一族里）、**读 0** | 只写不读（同上） |
+
+★ 另外 4 个"只写不读"的**诊断计数器**（同族，一并记，但不建议动）★★：
+`fe_endpoint.sent_total`（`kernel/include/fe/ipc.h:55`，写 `kernel/ipc/ipc.c` 的 `:366` 与 `:517`）、
+`fe_endpoint.recv_total`（`ipc.h:56`，写 `ipc.c:413` 与 `:796`）、
+`fe_notification.signal_total`（`ipc.h:68`，写 `ipc.c:1253`）、
+以及 `fe_thread`/`fe_task` 上那两个（上面第 3、4 条）。
+★ 它们与第 1、2 条**性质不同**：诊断计数器的"读"可以是"人肉读"（打印出来看），
+而 `wait_index` / `shared` 连**赋值**都没有——**它们是纯占位** ★
+
+★★ **一条方法上的提醒（这是本轮踩到的）** ★★
+上表第一次写出来时，`process.c` / `fault.c` / `ipc.c` 的**行号是错的**——
+不是抄错，是**在我核对期间 `kernel/ipc/ipc.c` 又被那个正在做 K11 的代理改了**
+（同一个文件、同一天）。所以**代码里的行号是易腐的引用**：
+凡是能写成"**函数名 + 行号**"的，一律写成两者都给（本表已经这么做）。
+★ 这与本轮修 MSI-X 注释时踩的是同一个坑：我在注释里写 `:930`，
+而我自己的编辑把它推到了 `:946` ★
+（`16-selfhost-path.md` 那条链的审计里记过同一件事）。
+
+★★ **与本行原记录不符的一处：`wait_satisfied` 现在有读者了** ★★
+本行原先（以及 `21-user-address-wait.md` 的字段表）记的是
+"`wait_satisfied` **只被写、全仓没有读者**"。**实测今天不是这样**：
+`kernel/ipc/ipc.c:1043` 已经有 `if (self->wait_satisfied)` 这个读者
+（K11 落地时补上的），写点是 `ipc.c:1016`（等待方清零），
+另有 `ipc.c:706`/`:765` 两处唤醒方置位。
+→ **"处理提前唤醒"这个意图已经落地**，`21-user-address-wait.md` 的对应行应当改掉
+（★ 那份文档不在本轮授权范围，所以只在这里记一句，**没有去改它** ★）。
+
+★ 本次审计**没有**发现的问题（明确写下来，免得下一个人重做）★★
+- `fe_wait_addr` / `fe_wake_addr` / `fe_wait_addr_waiters` / `fe_wait_addr_on_deadline`
+  / `fe_selftest_wait_addr`（`kernel/include/fe/ipc.h:228/233/238/244/312`）
+  **全部有定义、有调用**（`ipc.c:662/680/1056`、`main.c:700`、`sched.c:889`）——K11 是接上的。
+- `atoi` / `fe_snprintf` / `memmove` / 用户态堆这一族**历史欠账已经补齐**
+  （`user/libposix/stdlib.c:45`、`user/libfe/libfe.c:969`、`user/libposix/string.c:34`），
+  本轮复核**没有**复发。
+- `fe_exit`（`user/include/fe_user.h:442`）看似"只有声明"，实际定义在
+  `user/libfe/libfe.c:85` —— ★ 这正是判据 4 必须手工排噪音的理由：
+  它的函数头带了 `__attribute__((noreturn))`，第一版正则没认出来。★
 
 ★ 编号说明 ★ **K10 已经被 SMP 占用了**（§4 的第八步、`06-smp.md` 的 M10.x，
 `12-drivers.md:108`、`13-tasks-and-kill.md:692`、`15-exec.md:384`、
