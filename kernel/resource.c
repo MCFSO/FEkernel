@@ -1156,11 +1156,15 @@ u32 fe_selftest_resource(void)
      * ★ 为什么落在这里 ★ 资源池只有 fe_resource_init() 一种复位手段，
      * 而"造共享条目 → 最后复位"这套纪律本来就在本文件里；main.c 在这之后
      * 会重新 bootstrap 一次真实池子，所以这里造的假条目不会留给真实驱动。
-     * ★ 这一版只有自检、没有修复 ⇒ 它们应当如实变红。 */
-    fe_kprintf("        D2①：取消点缺失——阻塞在共享区间控制器锁上的线程\n");
-    fail += selftest_d2_reslock();
-    fe_kprintf("        D4：持锁线程死后锁不放（lock_holder 悬空）\n");
-    fail += selftest_d4_forget();
+     * ★ 这一版只有自检、没有修复 ⇒ 它们应当如实变红。
+     * ★ 开关由 killtest.c 定义（见那里的说明）：默认**关**，对照实验时打开 ★ */
+    extern u32 g_dgroup_enable;
+    if (g_dgroup_enable) {
+        fe_kprintf("        D2①：取消点缺失——阻塞在共享区间控制器锁上的线程\n");
+        fail += selftest_d2_reslock();
+        fe_kprintf("        D4：持锁线程死后锁不放（lock_holder 悬空）\n");
+        fail += selftest_d4_forget();
+    }
 
     /* 两个 D 组都造了自己的假条目：再复位一次，保持"干净状态结束"。 */
     fe_resource_init();

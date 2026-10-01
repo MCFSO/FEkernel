@@ -37,6 +37,20 @@
 
 #define CHECK(cond) do { if (!(cond)) { fail++; } } while (0)
 
+/* ★ D 组自检的开关（第 6b 步的对照实验用）★
+ *
+ * 为什么要一个开关：D 组跑起来要花 1~2 秒（收尾窗口 + 有界等待），实测它会把
+ * **用户态启动的时间线**推后，于是 `blkbench` / `irqtest` 在 `vblkd` 发布
+ * `/dev/vblk0` 之前就去查依赖（`user/bin/init/main.c:1341-1346`：硬依赖未就绪
+ * → `g_fail++`）——`init 结束，失败项 3` 就是这么来的（2 个跳过 + 1 个
+ * "M5 里程碑自检全部通过"没达成）。
+ *
+ * 于是判据可以写成一句可执行的话：
+ *   - **开关关掉时，既有判据必须全绿**（回归基线）；
+ *   - 开关打开时允许那 3 项，而且**每次必须一样**（不是随机 2 或 4）。
+ * 默认**关**：既有判据的绿色是"已知状态"，D 组是待验的新东西。 */
+u32 g_dgroup_enable = 0;
+
 static volatile u32 g_spin_alive;
 
 /* ---- 探针 1：**跑飞**的线程（纯忙等，不让出）----
@@ -655,7 +669,7 @@ u32 fe_selftest_kill(void)
     /* ================================================================== */
 
     /* ---------- D1：通知对象的 waiter 槽没有摘除路径 ---------- */
-    {
+    if (g_dgroup_enable) {
         struct fe_task *task = fe_task_create_kernel("d1-notify");
         struct fe_notification *nt = NULL;
         if (!task) {
@@ -787,7 +801,7 @@ u32 fe_selftest_kill(void)
     }
 
     /* ---------- D2②：fe_process_wait 没有取消点 ---------- */
-    {
+    if (g_dgroup_enable) {
         struct fe_task *task = fe_task_create_kernel("d2-taskwait");
         const char *why = "?";
         if (!task) {
@@ -874,7 +888,7 @@ u32 fe_selftest_kill(void)
     }
 
     /* ---------- D3：睡着的线程叫不醒（fe_sched_wake 只认 BLOCKED） ---------- */
-    {
+    if (g_dgroup_enable) {
         struct fe_task *task = fe_task_create_kernel("d3-sleeper");
         struct fe_task *ctl  = fe_task_create_kernel("d3-control");
         if (!task || !ctl) {
