@@ -625,6 +625,14 @@ FE_NORETURN void fe_kmain(void)
     f = fe_selftest_vma();       g_selftest_failures += f;
     fe_kprintf("        => 区间表失败项: %u\n", f);
     fe_kprintf("\n");
+    /* ★ C2 的最后一条：区间属性变更（mprotect）★
+     * 它紧跟在区间表自检之后，因为它验的正是**区间表与页表两处一起改**：
+     * 只改一处都有坏结局（只改 PTE ⇒ 下次缺页退回去；只改 VMA ⇒ 已映射的页
+     * 仍可写），所以这一组必须落在真的页表上，不能只动一张假的区间表。 */
+    fe_kprintf("[自检] 区间属性变更（mprotect：VMA + PTE + TLB）:\n");
+    f = fe_selftest_protect_range(); g_selftest_failures += f;
+    fe_kprintf("        => 区间保护失败项: %u\n", f);
+    fe_kprintf("\n");
     fe_kprintf("[自检] 线程局部存储（TLS：每线程一份 fs 基址）:\n");
     f = fe_selftest_tls();       g_selftest_failures += f;
     fe_kprintf("        => TLS 失败项: %u\n", f);

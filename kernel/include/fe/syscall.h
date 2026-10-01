@@ -64,6 +64,31 @@ enum fe_syscall_num {
     FE_SYS_MEM_UNMAP        = 0x22,
     FE_SYS_MEM_INFO         = 0x23,
 
+    /* 0x91 (addr, len, prot) —— 改一段**自己地址空间里**页面的访问权限。
+     *
+     * 参数形状与 MEM_MAP/MEM_UNMAP **同族**（addr/len + 权限位），
+     * 权限位复用既有的 `FE_PROT_READ`/`FE_PROT_WRITE`/`FE_PROT_EXEC`，
+     * 不另造一套。目标永远是**调用者自己**的地址空间——
+     * 接口里没有"指定别的任务"这个参数，所以"改到别人的内存"在形状上
+     * 就不可能（与 MEM_UNMAP 同一条纪律）。
+     *
+     * ★ 三条边界（每一条都有自检）★
+     *   1. **范围必须完全落在同一个 VMA 内**：跨区间 `FE_ERR_INVAL`、
+     *      端点不在任何区间 `FE_ERR_NOENT`。不扩展、不拆分——
+     *      猜意图猜错的后果是把一块调用者没打算改的内存改成只读；
+     *   2. **W^X**：一次调用同时给 W 与 X 返回 `FE_ERR_INVAL`。
+     *      本接口是用户态唯一能改页面权限的入口，所以 W^X 在这里是可强制
+     *      的（`MEM_MAP` 今天允许申请 W|X，那是既有行为，本次不动它）；
+     *   3. **写保护清单**（docs/04-write-protection.md）：那份清单的区间是
+     *      **磁盘 LBA**，与虚拟地址没有交集，所以这里没有可判的交集——
+     *      详见 kernel/mm/vma.c 里 `fe_vma_protect_range` 的说明。挡住
+     *      "绕过写保护"的是边界 1（只能改自己 VMA 内的页）。
+     *
+     * ★ 它同时改两处：VMA 的 flags 与已映射页的 PTE，并**逐页刷 TLB** ★
+     * 只改一处都有坏结局（见 fe/mm/vma.h 里 fe_vma_protect_range 的说明）；
+     * TLB 不刷则"页表说只读、TLB 还说可写"，用户态照写不误。 */
+    FE_SYS_MEM_PROTECT      = 0x91,
+
     FE_SYS_HANDLE_CLOSE     = 0x30,
     /* 句柄复制（权限只能收窄，不能放大）。
      * 用途：把同一个能力给同一个任务的另一个线程用。
@@ -327,7 +352,7 @@ enum fe_syscall_num {
      * 设计与代价见 docs/15-exec.md。 */
     FE_SYS_EXEC              = 0x90,
 
-    FE_SYS_MAX              = 0x91,
+    FE_SYS_MAX              = 0x92,
 };
 
 /* 资源类别，供 RESOURCE_LOCK/UNLOCK 与诊断使用。

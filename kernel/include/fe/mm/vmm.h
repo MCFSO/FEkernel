@@ -41,6 +41,22 @@ fe_status_t fe_vmm_unmap(struct fe_address_space *as, virt_addr_t virt, u64 size
 /* 解除映射并把物理帧归还 PMM */
 fe_status_t fe_vmm_unmap_free(struct fe_address_space *as, virt_addr_t virt, u64 size);
 
+/* ★ 改一段**已映射**页面的权限位（mprotect 的页表层）★
+ *
+ * 只改 `FE_PTE_WRITE` 与 `FE_PTE_NX` 两位，其余位（帧地址 / USER / NOFREE /
+ * PCD / GLOBAL）**原样保留**——它们描述"这一页是谁的、从哪来"，不是
+ * "允许怎么访问"（覆盖 NOFREE 会让任务销毁时把借来的帧还给 PMM，
+ * 那是实测抓过的一个 use-after-free）。`new_flags` 里除这两位之外的位被忽略。
+ *
+ * ★ 没映射的页跳过、不算错 ★ 区间里没映射的页是按需分页的正常状态；
+ * 调用者负责改 VMA 的 flags，那一页将来缺页时按新 flags 建映射。
+ *
+ * ★ 改完**逐页刷 TLB**（`invlpg`）★ 这是本函数存在的主要理由：软件改页表
+ * 硬件不知情，不刷就等于"页表说只读、TLB 还说可写"，用户态照写不误。
+ * 见 vmm.c 里实现的说明。 */
+fe_status_t fe_vmm_protect(struct fe_address_space *as, virt_addr_t virt,
+                           u64 size, u64 new_flags);
+
 /* 分配新物理帧并映射到指定虚拟地址区间 */
 fe_status_t fe_vmm_map_alloc(struct fe_address_space *as, virt_addr_t virt,
                              u64 size, u64 flags);

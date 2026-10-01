@@ -139,6 +139,12 @@ long fe_mem_unmap(void *addr, u64 size)
     return fe_syscall(FE_SYS_MEM_UNMAP, (long)addr, (long)size, 0, 0, 0, 0);
 }
 
+long fe_mem_protect(void *addr, u64 size, u32 prot)
+{
+    return fe_syscall(FE_SYS_MEM_PROTECT, (long)addr, (long)size, (long)prot,
+                      0, 0, 0);
+}
+
 long fe_handle_close(long handle)
 {
     return fe_syscall(FE_SYS_HANDLE_CLOSE, handle, 0, 0, 0, 0, 0);

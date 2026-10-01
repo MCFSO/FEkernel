@@ -213,6 +213,65 @@ fe_status_t fe_vmm_unmap_free(struct fe_address_space *as, virt_addr_t virt, u64
 }
 
 /* ------------------------------------------------------------------ */
+/* 权限变更（mprotect 的页表层）                                       */
+/* ------------------------------------------------------------------ */
+
+/* 改一段**已映射**页面的权限位，帧一个字节都不动。
+ *
+ * ★ 它是什么、不是什么 ★
+ *   - 是：把**已存在**的那些叶子项的 W 与 NX 两位改成 `new_flags` 指定的
+ *     样子。帧地址、USER、NOFREE、PCD/GLOBAL 这些位**原样保留**——它们描述的是
+ *     "这一页是谁的、从哪来"，不是"允许怎么访问"。把它们一起覆盖掉，
+ *     后果比权限改错更糟：NOFREE 被清 ⇒ 任务销毁时把借来的帧还给 PMM
+ *     （见 FE_PTE_NOFREE 的说明，实测症状是另一个进程在自己的代码上取指 #PF）；
+ *     USER 被清 ⇒ 用户态再也碰不到这一页，而 VMA 还在。
+ *   - 不是：不是"给整段区间建映射"。区间里没映射的页是**正常状态**
+ *     （按需分页的全部意义就在这），所以这里对不存在的页**直接跳过**、
+ *     返回成功，由调用者去改 VMA 的 flags——那一页将来缺页时
+ *     `demand_map_page` 会按新的 flags 建映射。
+ *
+ * ★ 为什么必须逐个叶子项改、不能只看 VMA ★
+ * 一个只改 VMA 的实现会让**已经映射的页保持旧权限**：用户态照样能写一个
+ * 刚刚被 mprotect 成只读的页（PTE 里 W 还是 1）。这正是本刀的正面判据。
+ *
+ * ★ TLB：改完必须逐页刷（这是本刀最容易漏的一步）★
+ * PTE 改了不等于 TLB 知道。x86-64 上软件改页表**硬件不知情**，于是
+ * "页表说只读、TLB 还说可写"这个窗口会一直存在到那条表项自己被换出——
+ * 用户态在此期间照写不误。修法只有一条：`invlpg`。
+ * 这里**对区间里的每一页都刷**（不管它当时有没有映射）：
+ *   - 没映射的页刷一次是空操作，代价可以忽略；
+ *   - 而**漏刷**的代价是这条安全属性静默失效。两者不对称，所以选宽的那边。
+ * x86-64 没有"按范围失效"的指令，只能逐页 `invlpg`；单核（`--smp 1`）下
+ * 这就够了——SMP 还需要给其它核发 IPI，见 docs/13-tasks-and-kill.md §6.5
+ * 的同一条边界。 */
+fe_status_t fe_vmm_protect(struct fe_address_space *as, virt_addr_t virt,
+                           u64 size, u64 new_flags)
+{
+    if (!as) {
+        return FE_ERR_INVAL;
+    }
+    if (size == 0 || !fe_is_aligned(virt, FE_FRAME_SIZE) ||
+        !fe_is_aligned(size, FE_FRAME_SIZE)) {
+        return FE_ERR_INVAL;
+    }
+    /* 只允许改这两位：调用者传别的位一律忽略，而不是让它们生效。
+     * 这是接口的一部分——理由见上面"不是什么"那一段。 */
+    const u64 touch = FE_PTE_WRITE | FE_PTE_NX;
+
+    for (u64 off = 0; off < size; off += FE_FRAME_SIZE) {
+        virt_addr_t va = virt + off;
+        u64 *pte = pte_for(as, va, false);
+        if (pte && (*pte & FE_PTE_PRESENT) && !(*pte & FE_PTE_HUGE)) {
+            u64 keep = *pte & ~touch;
+            *pte = keep | (new_flags & touch);
+        }
+        /* 刷 TLB 在叶子项处理之后、且对每一页都做（理由见上）。 */
+        fe_vmm_flush_tlb_page(va);
+    }
+    return FE_OK;
+}
+
+/* ------------------------------------------------------------------ */
 /* 查询                                                                */
 /* ------------------------------------------------------------------ */
 

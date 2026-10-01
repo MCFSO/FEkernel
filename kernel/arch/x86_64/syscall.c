@@ -20,6 +20,7 @@
 #include <fe/time.h>
 #include <fe/mm.h>
 #include <fe/mm/vmm.h>
+#include <fe/mm/vma.h>      /* fe_vma_protect_range（MEM_PROTECT 的机制层） */
 #include <fe/mm/kheap.h>
 #include <fe/mm/pmm.h>
 #include <fe/sched/sched.h>
@@ -253,6 +254,64 @@ static i64 sys_mem_unmap(u64 addr, u64 size)
     }
     fe_status_t s = fe_vmm_unmap(t->space, (virt_addr_t)addr, end - addr);
     return (s == FE_ERR_NOENT) ? FE_OK : (i64)s;
+}
+
+/* 改一段**调用者自己地址空间里**页面的访问权限（C2 的最后一条）。
+ *
+ * ★ 参数形状与 MEM_MAP/MEM_UNMAP 同族 ★ addr / len / prot 三个参数，
+ * 权限位复用既有的 `FE_PROT_*`（`fe_user.h` 与内核这一份是同一套值）。
+ *
+ * ★ 边界：只认自己的地址空间 ★
+ * 目标恒为 `fe_task_current()`，接口里没有"指定别的任务"这个参数——
+ * 与 `MEM_UNMAP` 同一条纪律。所以"改到别人的内存"在**形状上**就不可能，
+ * 而不是靠一句运行期比对（那种判据会漂，而且漏一处就是一个洞）。
+ *
+ * ★ 与 MEM_UNMAP 不同的一点：这里**不限制在 mmap 区** ★
+ * UNMAP 限制在 mmap 区，是因为"把自己的代码页拆掉"只是陷阱、没有用处；
+ * 而**改权限**对映像段与栈恰恰是正当用途（`libposix` 的 `mprotect`
+ * 就要能给任意自己映射过的段松紧权限）。安全边界因此落在**别处**：
+ * 范围必须完全落在调用者自己的某个 VMA 内（`fe_vma_protect_range` 判），
+ * 而 VMA 是内核在装载映像/建栈/做映射时建立的——用户态无法凭空造一个
+ * 覆盖别人内存的区间。
+ *
+ * ★ 权限位到 VMA 标志的翻译放在这一层 ★
+ * 上层的 `fe_vma_protect_range` 只认 `FE_VMA_*`；`FE_PROT_*` 是 ABI 那一侧
+ * 的名字。两套值**今天恰好同序但语义不同**（`FE_PROT_USER` 在 VMA 侧没有
+ * 对应物），所以必须显式翻译一遍，不能指望数值相等就把掩码直接传下去。 */
+static i64 sys_mem_protect(u64 addr, u64 len, u64 prot)
+{
+    struct fe_task *t = fe_task_current();
+    if (!t || !t->space || !t->vmas) {
+        return FE_ERR_ACCESS;       /* 内核线程不走这条路 */
+    }
+    if (len == 0 || (addr & (FE_FRAME_SIZE - 1)) != 0) {
+        return FE_ERR_INVAL;
+    }
+    /* 用户指针必须是用户地址：用户空间之上的地址一律拒绝。
+     * （`addr` 是调用者给的，不是内核算出来的，所以要自己判一次。） */
+    if (addr >= FE_USER_SPACE_END || addr + len < addr ||
+        addr + len > FE_USER_SPACE_END) {
+        return FE_ERR_INVAL;
+    }
+    /* 只认这三位；多给别的位（比如 FE_PROT_USER）一律拒绝，
+     * 而不是"忽略多余位"——后者会让"用户态以为自己设了什么"与
+     * "内核实际做了什么"不一致。 */
+    if (prot & ~(u64)(FE_PROT_READ | FE_PROT_WRITE | FE_PROT_EXEC)) {
+        return FE_ERR_INVAL;
+    }
+    u32 vflags = 0;
+    if (prot & FE_PROT_READ)  { vflags |= FE_VMA_READ; }
+    if (prot & FE_PROT_WRITE) { vflags |= FE_VMA_WRITE; }
+    if (prot & FE_PROT_EXEC)  { vflags |= FE_VMA_EXEC; }
+
+    /* 范围要按页对齐地覆盖 [addr, addr+len)：与 UNMAP 一样向上取整，
+     * 并且把"没覆盖到任何页"这种空范围挡掉。 */
+    u64 end = addr + FE_FRAME_ALIGN_UP(len);
+    if (end <= addr) {
+        return FE_ERR_OVERFLOW;
+    }
+    return (i64)fe_vma_protect_range(t->vmas, t->space, (virt_addr_t)addr,
+                                     (virt_addr_t)end, vflags);
 }
 
 static i64 sys_endpoint_create(u64 flags)
@@ -1431,6 +1490,9 @@ void fe_syscall_dispatch(struct fe_regs *r)
         break;
     case FE_SYS_MEM_UNMAP:
         ret = sys_mem_unmap(a1, a2);
+        break;
+    case FE_SYS_MEM_PROTECT:
+        ret = sys_mem_protect(a1, a2, a3);
         break;
     case FE_SYS_HANDLE_CLOSE:
         ret = sys_handle_close(a1);

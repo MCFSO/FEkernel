@@ -104,8 +104,31 @@ u32 fe_vma_remove_range(struct fe_vma_table *t, virt_addr_t base, virt_addr_t en
 fe_status_t fe_vma_grow_down(struct fe_vma_table *t, struct fe_vma *v,
                              virt_addr_t new_base);
 
+/* ★ 改一段页面的权限：VMA 的 flags **与**已映射页的 PTE 权限，并刷 TLB ★
+ *
+ * 这是 `mprotect` 的机制层。两条缺一不可（各自的坏结局见 vma.c 的说明）：
+ *   - 只改 PTE ⇒ 下次缺页重新补页时权限退回旧的（`demand_map_page` 按 flags 建）；
+ *   - 只改 VMA ⇒ 已经映射的页保持旧权限，用户态照样写得进去。
+ *
+ * 三条安全边界（每条都有自检）：
+ *   1. **范围必须完全落在同一个 VMA 内**：跨区间返回 `FE_ERR_INVAL`、
+ *      端点不在任何区间返回 `FE_ERR_NOENT`；不扩展、不拆分；
+ *   2. **W^X**：同时给出 W 与 X 返回 `FE_ERR_INVAL`；
+ *   3. **写保护清单**：那份清单的区间是**磁盘 LBA**，与虚拟地址没有交集，
+ *      这里没有可判的交集——详见 vma.c 里那段如实说明。真正挡住
+ *      "改到别人的内存"的是边界 1（只能改自己地址空间里、自己 VMA 内的页）。
+ *
+ * `new_vma_flags` 只认 `FE_VMA_READ`/`FE_VMA_WRITE`/`FE_VMA_EXEC` 三位，
+ * 其余位传进来返回 `FE_ERR_INVAL`（GROWSDOWN/ANON 描述"这段内存是什么"，
+ * 不是"允许怎么访问"，不许从这里改）。 */
+fe_status_t fe_vma_protect_range(struct fe_vma_table *vt, struct fe_address_space *as,
+                                 virt_addr_t base, virt_addr_t end, u32 new_vma_flags);
+
 /* 诊断：把区间表打到串口（自检与排错用） */
 void fe_vma_dump(const struct fe_vma_table *t, const char *who);
+
+/* 自检：区间属性变更（mprotect 的机制层 + 三条安全边界）。返回失败项数。 */
+u32 fe_selftest_protect_range(void);
 
 /* 自检：区间表的插入/重叠拒绝/裁剪删除/增长。返回失败项数。 */
 u32 fe_selftest_vma(void);

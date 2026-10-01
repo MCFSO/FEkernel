@@ -68,6 +68,10 @@
 #define FE_SYS_MEM_MAP          0x21
 #define FE_SYS_MEM_UNMAP        0x22
 #define FE_SYS_MEM_INFO         0x23
+/* 改一段**自己地址空间里**页面的访问权限（与 fe_mem_map/fe_mem_unmap 同族）。
+ * 三条边界：范围必须完全落在同一个 VMA 内 / 不许一次给 W|X / 只作用于
+ * 调用者自己（接口里没有"指定别的任务"这个参数）。详见 fe_mem_protect。 */
+#define FE_SYS_MEM_PROTECT      0x91
 #define FE_SYS_HANDLE_CLOSE     0x30
 #define FE_SYS_HANDLE_DUP       0x31
 #define FE_SYS_IRQ_REGISTER     0x40
@@ -445,6 +449,21 @@ void *fe_mem_map(long handle, void *hint, u64 size, u32 prot);
  * 想真正释放就关掉最后一个句柄（那是对象生命周期的事）。
  * 只接受 mmap 区内的地址，详见 docs/09-handle-transfer.md §4.1。 */
 long fe_mem_unmap(void *addr, u64 size);
+/* 改一段自己地址空间里页面的访问权限。prot 用 FE_PROT_READ/WRITE/EXEC
+ * （与 fe_mem_map 同一套位）。
+ *
+ * 返回 0 成功、负错误码失败：
+ *   FE_ERR_INVAL —— 范围跨了多个区间 / 未对齐 / 同时给 W|X / 传了别的位；
+ *   FE_ERR_NOENT —— 范围的端点不在任何区间里（没映射过的地址）；
+ *   FE_ERR_ACCESS—— 内核线程调用。
+ *
+ * ★ 两个容易踩的点 ★
+ *   1. **只改权限，不建映射**：区间里还没碰过的页仍然是"缺页时按新权限补"，
+ *      所以对一块从未访问过的区间调它不会立刻看到效果——这是对的
+ *      （按需分页的语义），不是失败；
+ *   2. **W^X**：想给一块内存"既可写又可执行"会被拒。要跑新代码就先写成
+ *      可执行、再按需在别的地方准备数据——这是这个内核的既定安全策略。 */
+long fe_mem_protect(void *addr, u64 size, u32 prot);
 long fe_mem_info(long handle, struct fe_mem_info *out);
 long fe_handle_close(long handle);
 /* 句柄复制（权限只能收窄）。new_rights = 0 表示沿用原权限。
