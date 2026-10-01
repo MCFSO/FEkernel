@@ -397,3 +397,94 @@ u32 fe_selftest_sched(void)
                (unsigned long long)fe_thread_live_count());
     return fail;
 }
+
+/* ------------------------------------------------------------------ */
+/* ★ 让出代价自检：**"让出一次要等多久"的最小复现**（第 7 步）★        */
+/* ------------------------------------------------------------------ */
+
+/* ★ 为什么要单独一条自检，而且必须**在别的线程都死光之后**跑 ★
+ *
+ * 要观察的现象只有一个：**当前线程让出之后，多久才轮回到自己**。
+ * 只要有**任何**别的就绪线程在跑，"多久"里就混进了"别人跑多久"这个
+ * 无关变量——那正是 D 组那种大自检把结论搅浑的原因（它的结论是
+ * "某个循环跑不完"，而"跑不完"既可以是被饿、也可以是纯粹活多）。
+ *
+ * 所以这里的现场被压到最小：**只有 main 与 idle 两个线程可运行**
+ * （调用点保证：本自检在 fe_selftest_sched 之后、其它线程都已被 join）。
+ * 于是判据可以写成一句可执行的话：
+ *
+ *     让出 N 次，所用的**节拍数**不该超过 4N。
+ *
+ * ★ 为什么判据是"节拍数"而不是"花了多少轮" ★
+ * 轮数是循环变量，它永远等于 N——被饿的时候它一个不少，只是每轮要等
+ * 很久。**时间是唯一能分辨"快"与"慢"的量**（第 6 步踩过这个坑：
+ * "20000 轮让出"看起来是个时间预算，实际上什么都不是）。
+ *
+ * ★ 为什么允许 4N 而不是 N ★
+ * 一次让出在最坏情况下要走完"别人一个时间片"（默认 10 节拍），所以
+ * 单看一轮可能花 10 个节拍。但**平均**不该接近 10：只有 main 与 idle
+ * 时，idle 每轮也必须让出（它只做 fe_sched_reap + hlt），所以两边的
+ * 让出次数是可比的。4N 是给"让出本身的开销 + 节拍粒度"留的余量，
+ * 不是给"被饿"留的——被饿时这个数会落到 10N 量级（实测 10:1）。
+ *
+ * ★ 反向对照 ★ 同时报出公平性计数：如果 `fast`（取到的就是自己）占
+ * 绝大多数，说明"让出"根本没换人，那这条判据测的就不是切换开销；
+ * 两种情况都要能看见，不能只报一个数。 */
+#define YIELD_PROBE_ROUNDS 2000u
+#define YIELD_PROBE_ALLOW  4u
+
+u32 fe_selftest_yield(void)
+{
+    u32 fail = 0;
+    struct fe_thread *me = fe_thread_current();
+    u64 k0 = fe_time_ticks();
+    u64 c0 = fe_rdtsc();
+
+    fe_sched_fairness_reset();
+    for (u32 i = 0; i < YIELD_PROBE_ROUNDS; i++) {
+        fe_thread_yield();
+    }
+
+    u64 c1 = fe_rdtsc();
+    u64 k1 = fe_time_ticks();
+    u64 ticks = k1 - k0;
+    u64 allow = (u64)YIELD_PROBE_ROUNDS * YIELD_PROBE_ALLOW;
+
+    u64 picked = 0, fast = 0, switched = 0, nullpick = 0, idlerun = 0, idlehi = 0;
+    fe_sched_fairness(&picked, &fast, &switched, &nullpick, &idlerun, &idlehi);
+    u64 kept = fe_sched_kept_lower();
+    u64 cand = fe_sched_idle_cand();
+
+    u64 hz = fe_time_hz() ? fe_time_hz() : 1000u;
+    fe_kprintf("[自检] 让出代价（只有 %s 与 idle 可运行）:\n",
+               me ? me->name : "?");
+    fe_kprintf("        让出 %u 次，用掉 %llu 个节拍（%llu us，%llu 周期/次）；"
+               "允许上界 %llu 节拍\n",
+               (unsigned)YIELD_PROBE_ROUNDS, (unsigned long long)ticks,
+               (unsigned long long)(ticks * 1000000ull / hz),
+               (unsigned long long)((c1 - c0) / YIELD_PROBE_ROUNDS),
+               (unsigned long long)allow);
+    fe_kprintf("        调度计数: 取到线程 %llu（其中就是自己 %llu）、真换栈 %llu、"
+               "无人可换 %llu、选中 idle %llu、idle 占着而高处有人就绪 %llu 节拍\n",
+               (unsigned long long)picked, (unsigned long long)fast,
+               (unsigned long long)switched, (unsigned long long)nullpick,
+               (unsigned long long)idlerun, (unsigned long long)idlehi);
+    fe_kprintf("        让出代价: 候选是 idle %llu 次，其中让出退化成空操作 %llu 次"
+               "（这一次让出没有换人）\n",
+               (unsigned long long)cand, (unsigned long long)kept);
+
+    if (ticks > allow) {
+        fe_kprintf("        **失败**：让出 %u 次花了 %llu 个节拍 > 上界 %llu"
+                   "（%llu.%02llu 节拍/次）——让出之后要等别人一整个时间片\n",
+                   (unsigned)YIELD_PROBE_ROUNDS, (unsigned long long)ticks,
+                   (unsigned long long)allow,
+                   (unsigned long long)(ticks * 100ull / YIELD_PROBE_ROUNDS / 100ull),
+                   (unsigned long long)(ticks * 100ull / YIELD_PROBE_ROUNDS % 100ull));
+        fail++;
+    } else {
+        fe_kprintf("        OK   让出代价在界内（%llu.%02llu 节拍/次）\n",
+                   (unsigned long long)(ticks * 100ull / YIELD_PROBE_ROUNDS / 100ull),
+                   (unsigned long long)(ticks * 100ull / YIELD_PROBE_ROUNDS % 100ull));
+    }
+    return fail;
+}

@@ -65,6 +65,34 @@ void fe_sched_dump(void);
 /* M2 调度器自检：返回失败项数（0 = 全部通过）。会创建并回收若干测试线程。 */
 u32 fe_selftest_sched(void);
 
+/* ★ 让出代价自检：**量一次让出要花几个节拍**（第 7 步的最小复现）★
+ *
+ * 判据是"让出 N 次所花的**节拍数**不超过 4N"——量的是时间，不是轮数
+ * （轮数在被饿的情况下不是时间的度量，这是第 6 步的教训）。
+ * 返回失败项数。 */
+u32 fe_selftest_yield(void);
+
+/* ---- 调度公平性的**计数**（不是打印）----
+ *
+ * ★ 为什么是计数器 ★ 串口是轮询输出、一行上百微秒到毫秒，而节拍是 1 ms；
+ * 在调度路径上打印会**改变被测对象**（实测：加打印后同一段基准的切换数
+ * 从 10 万涨到 24 万）。所以判据用只加几十条指令的计数器：
+ *   picked  = 成功取到线程的次数（含"取到的就是当前线程"）
+ *   fast    = 取到的就是当前线程 → 这次让出**没有换人**
+ *   switched= 真的换了栈
+ *   nullpick= 就绪位图为空 → 没人可换，当前线程继续跑
+ *   idle_run= 选中空闲线程的次数
+ *   tick_idle_higher_ready = CPU 落在空闲线程上、而更高优先级有人就绪的节拍数
+ *                            （严格优先级下这个数**应当为 0**） */
+void fe_sched_fairness(u64 *picked, u64 *fast, u64 *switched, u64 *nullpick,
+                       u64 *idle_run, u64 *tick_idle_higher_ready);
+void fe_sched_fairness_reset(void);
+
+/* "队列里只有更低优先级的就绪者，于是让出退化成空操作"的次数。
+ * 它应当随"有多少次让出是空转"增长——第 7 步修复的直接证据。 */
+u64 fe_sched_kept_lower(void);
+u64 fe_sched_idle_cand(void);
+
 #endif /* FE_SCHED_SCHED_H */
 
 /* TLS 自检：每线程独立的 %fs 基址（隔离性，含反向对照）。返回失败项数。 */

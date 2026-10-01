@@ -41,6 +41,69 @@ static u64  g_next_id = 1;
 static u32  g_default_slice = 10;   /* 10 个节拍：1000Hz 下即 10ms */
 static u64  g_created_total;
 
+/* ------------------------------------------------------------------ */
+/* 调度公平性的**计数器**（不是打印）                                  */
+/* ------------------------------------------------------------------ */
+/* ★ 为什么用计数器而不是打印 ★
+ *
+ * "让出后被饿 10 倍"这个现象本身有一个自欺的陷阱：**打印会改变被测对象**。
+ * 串口是轮询输出、一行要上百微秒到毫秒（`fe_serial_putc` 忙等 THR），
+ * 而节拍是 1 ms —— 在调度路径上打一行，等于给那一次调度插进一个"时间片"。
+ * 前面几轮诊断打印之后，同一段基准的切换数从 10 万涨到 24 万，
+ * 就是这个自欺的实测证据。
+ *
+ * 所以公平性的判据改成**只加几个计数器**（每次切换几十条指令，不打印）：
+ *   - `picked`  ：rq_pick 成功取到一个线程的次数；
+ *   - `fast`    ：取到的就是当前线程（next == prev）→ 本次让出**没有换人**；
+ *   - `switched`：真的换了栈（next != prev）；
+ *   - `starve`  ：取到的是**比就绪队列里最高优先级更低**的线程（不该发生：
+ *                 它就是"高优先级就绪了却被低优先级占着"的可数形态）；
+ *   - `nullpick`：位图为 0 而返回 NULL（当前线程继续跑）。
+ * 这五个数字能直接把"轮不到"和"轮到了但只给一个节拍"分开。 */
+static u64 g_st_picked;
+static u64 g_st_fast;
+static u64 g_st_switched;
+static u64 g_st_nullpick;   /* 位图为空导致的"没人可换" */
+static u64 g_st_idle_run;   /* 选中 idle 的次数 */
+static u64 g_st_kept_lower; /* "让出退化成空操作"的次数（唯一可运行的非空闲线程） */
+static u64 g_st_idle_cand;  /* 让出时下一个候选是空闲线程的次数（诊断用） */
+static u64 g_st_tick_idle_higher_ready; /* idle 在跑、而 16 级以上有人就绪的节拍数 */
+
+void fe_sched_fairness(u64 *picked, u64 *fast, u64 *switched, u64 *nullpick,
+                       u64 *idle_run, u64 *tick_idle_higher_ready)
+{
+    if (picked) { *picked = g_st_picked; }
+    if (fast) { *fast = g_st_fast; }
+    if (switched) { *switched = g_st_switched; }
+    if (nullpick) { *nullpick = g_st_nullpick; }
+    if (idle_run) { *idle_run = g_st_idle_run; }
+    if (tick_idle_higher_ready) { *tick_idle_higher_ready = g_st_tick_idle_higher_ready; }
+}
+
+/* "让出退化成空操作"的次数：此刻只有当前线程与空闲线程可跑，
+ * 于是让出没有换人（第 7 步修复的直接证据）。 */
+u64 fe_sched_kept_lower(void)
+{
+    return g_st_kept_lower;
+}
+
+u64 fe_sched_idle_cand(void)
+{
+    return g_st_idle_cand;
+}
+
+void fe_sched_fairness_reset(void)
+{
+    g_st_picked = 0;
+    g_st_fast = 0;
+    g_st_switched = 0;
+    g_st_nullpick = 0;
+    g_st_idle_run = 0;
+    g_st_kept_lower = 0;
+    g_st_idle_cand = 0;
+    g_st_tick_idle_higher_ready = 0;
+}
+
 /* 线程死亡的唯一登记处（变僵尸 + 唤醒父进程的 wait）。
  * 前向声明：闸门 fe_sched_maybe_switch 在切换核心那一节，而它的定义在
  * 退出那一节——顺序是文件结构决定的，但两者是同一件事的两端。 */
@@ -483,6 +546,85 @@ u64 fe_sched_maybe_switch(u64 rsp)
     struct fe_thread *prev = g_current;
     struct fe_thread *next = rq_pick();
 
+    /* ★ 关键一条：**当前线程是"唯一可运行的非空闲线程"时，让出是空操作** ★
+     *
+     * ★ 不修它的症状（第 7 步实测，最小复现的原文）★
+     * 一个 prio=16 的线程每次主动让出，都要等 prio=0 的空闲线程跑满
+     * **一整个时间片**（10 个节拍）才轮回来：
+     *   让出 2000 次，用掉 20002 个节拍（10.00 节拍/次，上界 4.00）；
+     *   计数：真换栈 4000 次、选中 idle 2000 次、
+     *         "idle 占着而高处有人就绪" 20000 个节拍。
+     * 于是 `fe_task_wait_others_dead`（20 万轮让出）与 `fe_thread_join`
+     * （200 万轮让出）从毫秒级掉到分钟级——`sys_exec` 正要靠它们等线程死透。
+     *
+     * ★ 为什么这是"语义错"而不是"精度差" ★
+     * 让出的合法含义是"把 CPU 交给**别的**线程"。当队列里除了它自己只有
+     * 空闲线程时，让出被解释成了"把自己降级给 idle、再等一整个时间片抢回来"
+     * ——那不是让出，那是**自我降级**。idle 的职责是"没有别人可跑时填满
+     * CPU"，而不是"被每一次让出强行插入一个时间片"。
+     *
+     * ★ 判据为什么必须收窄到"唯一可运行的非空闲线程"（实测代价）★
+     * 第一版写成"下一个候选比自己优先级低就让出变空操作"，结果**打破了
+     * 空闲线程的收尸职责**：让出不再切到 idle ⇒ `fe_sched_reap()` 不被调用
+     * ⇒ 僵尸线程永不回收 ⇒ 任务的线程数不减 ⇒ `waitpid` 永远不返回、
+     * `init` 停在半路（实测：`init 结束` 一行再也不出现、"控制台客户端"
+     * 等 6 个单元整段缺席）。
+     * 收窄之后 idle 仍然会被时间片抢占后的调度选中（那时 mask 里只有它），
+     * 收尸照常进行。
+     *
+     * ★ 判据（三个条件同时成立才收窄）★
+     *   1. `next` 是空闲线程（`priority == FE_PRIO_IDLE`）；
+     *   2. `prev` 是它那一级**唯一**的线程（队头 == 队尾 == prev）；
+     *   3. 就绪位图里**只有它那一级**（没有更高、也没有别的级）。
+     * 三条合起来就是"此刻除了 prev 自己，只有 idle 可跑"。这时把 CPU 留在
+     * prev 身上不违反任何优先级承诺——因为**没有别人在等**。
+     *
+     * ★ 同级有同伴时照旧切换 ★ 条件是"唯一"，所以两个同级线程互相让出
+     * （轮转、以及 `fe_thread_yield` 的常规用法）走的是原来的路径，
+     * 一个字都没变。 */
+    if (next && prev && next->priority == FE_PRIO_IDLE) {
+        g_st_idle_cand++;
+        /* 判据三条（缺一条就有具体的坏结局）：
+         *
+         *   1. **位图里没有任何非空闲线程**（位 1..31 全为 0）。
+         *      ★ 为什么不是"位图 == 1<<prev->priority"（第一版的错）★
+         *      `prev` 此刻是 RUNNING、**已经不在队列里**——单线程那一级在位图里
+         *      对应位就是 0。所以"只有 prev 可跑"在位图上的正确形态是
+         *      `mask == 0`（0x10000 那个形态只出现在 prev 被换下、重新入队之后）。
+         *      用错形态的后果是判据一次都不命中：实测 idle 候选 2000 次、
+         *      命中 0 次，让出代价照旧 10.00 节拍/次。
+         *   2. **`prev` 仍然 RUNNING**。
+         *      ★ 漏掉它的后果是**内核 panic**（实测）：`fe_thread_exit` 那条路
+         *      先把状态设成 DEAD 再走切换点——这正是闸门判死（kill）的实现。
+         *      没有这一条，"保持当前线程"会把一条**已经被判定死亡**的线程留在
+         *      CPU 上，于是 `fe_sched_maybe_switch` 里那条"DEAD 线程没有可切换
+         *      目标"的断言直接崩：实测 `原因: 被终止的线程 hog 没有可切换的
+         *      目标——闸门失效`。它同时保证"阻塞/睡眠"那两条路照常切走。
+         *   3. **`next` 是空闲线程**（上面的 if 已经保证）。
+         *
+         * 三条合起来 = "此刻除了 prev 自己，只有空闲线程可跑"。这时把 CPU
+         * 留在 prev 身上不违反任何优先级承诺——因为**没有别人在等**。 */
+        if (prev->state == FE_THREAD_RUNNING &&
+            g_ready_mask < (1u << (FE_PRIO_IDLE + 1u))) {
+            rq_push(next);  /* 放回队尾：摘下来了就必须放回去 */
+            next = prev;    /* 让出退化成一次空操作 */
+            g_st_kept_lower++;
+        }
+    }
+
+    if (!next) {
+        g_st_nullpick++;
+    } else if (next == prev) {
+        g_st_picked++;
+        g_st_fast++;
+    } else {
+        g_st_picked++;
+        g_st_switched++;
+        if (next->priority == FE_PRIO_IDLE) {
+            g_st_idle_run++;
+        }
+    }
+
     if (!next || next == prev) {
         /* ★ 这一条早退对"刚被标记死亡"的线程是**禁止**的 ★
          * 返回 rsp 意味着"继续跑当前的"，而当前的已经死了——
@@ -492,6 +634,26 @@ u64 fe_sched_maybe_switch(u64 rsp)
         if (prev && prev->state == FE_THREAD_DEAD) {
             fe_panic("被终止的线程 %s 没有可切换的目标——闸门失效",
                      prev->name);
+        }
+        /* ★ 这一条早退**必须补一次时间片**（第 7 步实测逼出来的）★
+         *
+         * ★ 不补的症状（一次真实的挂死）★ 时间片用完时 `fe_sched_tick`
+         * 会把 slice 扣到 0 并置 `g_need_resched`；切换点进来一看"没人
+         * 可换"（就是上面那条让出退化成空操作，或者本来只有自己在跑），
+         * 于是返回 rsp 继续跑当前的——而 `next->slice = 默认时间片` 那句
+         * 在**切换路径上**，这条早退根本走不到它。结果 slice 永远停在 0：
+         * 每个节拍都请求重调度、每次都被这条早退吞掉，线程**再也没有
+         * 被抢占的机会**（它的 CPU 占用节拍还在涨，但 `switches` 不涨）。
+         * 实测症状：`fe_thread_join(init)` 的两百万轮让出跑完也没等到
+         * init 死透——因为这个线程把 CPU 占死了，init 拿不到时间片。
+         *
+         * ★ 为什么补时间片是正确的（而不是"绕过问题"）★ 早退的含义是
+         * "本轮不换人"，不是"取消本轮时间片"。让当前线程继续跑，就该给它
+         * 一个完整的新时间片——这与切换路径上给 `next` 补时间片是同一件事，
+         * 只是这次 `next` 就是 `prev`。补上之后 `g_need_resched` 不再每拍
+         * 都被置起，别的线程仍能在下一个时间片边界拿到 CPU。 */
+        if (prev && prev->state == FE_THREAD_RUNNING) {
+            prev->slice = (i32)g_default_slice;
         }
         return rsp;     /* 没有别的可运行线程：继续跑当前的 */
     }
@@ -745,6 +907,7 @@ static u32 g_wd_quiet;
 static u32 g_wd_prints;
 u64 g_dbg_last_switch_rsp;
 
+/* 看门狗用的"这个线程在哪条就绪链上" */
 static bool wd_in_queue(struct fe_thread *t, u32 *out_prio)
 {
     for (u32 p = 0; p < FE_THREAD_PRIO_LEVELS; p++) {
@@ -783,6 +946,10 @@ static void wd_tick(void)
     } else {
         g_wd_quiet = 0;
     }
+    /* ★ 轨迹倒出：在"饥饿窗口"里周期性倒出最近的选人/节拍事件 ★
+     *
+     * 判据是事实（main 就绪而 run 的不是它，已经连续 150 个节拍），
+     * 每 100 个节拍倒一次、最多 3 次——串口很慢，倒多了就把被测现象改掉了。 */
     if (g_wd_quiet >= 200 && g_wd_prints < 2) {
         g_wd_prints++;
         u32 p = 0;
@@ -812,6 +979,12 @@ void fe_sched_tick(void)
 
     wake_sleepers(fe_time_ns());
     wd_tick();
+    /* 计数"CPU 落在低优先级的空闲线程上、而更高优先级有人就绪"的节拍——
+     * 这是严格优先级调度下**不该出现**的组合（第 7 步的判据数字）。 */
+    if (g_current && g_current->priority == FE_PRIO_IDLE &&
+        (g_ready_mask >> (FE_PRIO_IDLE + 1)) != 0) {
+        g_st_tick_idle_higher_ready++;
+    }
 
     struct fe_thread *t = g_current;
     if (t && t->state == FE_THREAD_RUNNING) {
@@ -1037,13 +1210,31 @@ i32 fe_thread_join(struct fe_thread *t)
      * 表现为「某个内核线程一直在跑却什么都不做」这种极难定位的症状。
      * 未被 join 的线程会留在僵尸链上，等将来有专门的回收服务再处理。
      *
-     * 等待方式用「主动让出」而不是睡眠：让出不会把自己的调度状态卷进睡眠链表。 */
+     * 等待方式用「主动让出」而不是睡眠：让出不会把自己的调度状态卷进睡眠链表。
+     *
+     * ★ "让出"是廉价的——所以这一轮循环的**轮数上限必须跟着改**（第 7 步补）★
+     * 让出的语义修好之后（见 `fe_sched_maybe_switch` 里那条"唯一可运行的
+     * 非空闲线程"的判据），一次让出从"一次降级切换 + 等一个时间片"
+     * （实测约 3 万周期）变成"几十条指令"（实测约 500 周期）——**快了 60 倍**。
+     * 依赖"让出很慢"的东西立刻浮出水面：这里的 `2000000` 轮上限原本是
+     * 按"每轮约一个时间片"估的，修好之后两百万轮只要**零点几秒**就跑完，
+     * 于是 join 会在被等的线程还没死透时就超时放弃，**放弃之后还把它
+     * `thread_free` 掉**——那是一次 use-after-free（实测：`init` 的线程对象
+     * 被释放之后它再也走不到收尾，`init 结束` 一行从此消失、
+     * 后面 6 个单元整段不再启动）。
+     *
+     * 轮数是"让出很贵"时代的产物，**同一份代码里的常数必须跟着机制一起改**。
+     * 新上限按实测比例放大：两百万轮 ≈ 0.2 秒 ⇒ 两千万轮 ≈ 2 秒，
+     * 足够覆盖"拉起 28 个单元 + 等最后几个守护进程"的时间尺度。 */
     u32 spins = 0;
     while (t->state != FE_THREAD_DEAD) {
         fe_thread_yield();
-        if (++spins >= 2000000u) {
-            fe_kprintf("[join] 等待线程 %s 超时（状态 %u），放弃等待\n",
-                       t->name, t->state);
+        fe_sched_reap_except(t);    /* 顺手收尸，但绝不碰正在等的那一个 */
+        if (++spins >= 20000000u) {
+            fe_kprintf("[join] 等待线程 %s 超时（状态 %u），放弃等待；"
+                       "就绪位图=%#x 当前线程=%s\n",
+                       t->name, t->state, g_ready_mask,
+                       g_current ? g_current->name : "-");
             break;
         }
     }

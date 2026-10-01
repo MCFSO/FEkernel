@@ -607,6 +607,16 @@ FE_NORETURN void fe_kmain(void)
     f = fe_selftest_sched();     g_selftest_failures += f;
     fe_kprintf("        => 调度器失败项: %u\n", f);
     fe_kprintf("\n");
+    /* ★ 让出代价自检紧跟在调度器自检之后 ★
+     *
+     * 位置是判据的一部分：这一条测的是"让出一次要等多久"，只有
+     * **现场最小**（除 main 与 idle 外没有别的就绪线程）时那个数才干净。
+     * 放到后面（比如收尾处）就会被用户态服务与测试线程的临时活动污染，
+     * 测出来的就不是"让出的固有代价"。 */
+    fe_kprintf("[自检] 让出代价（第 7 步：让出一次要等多久）:\n");
+    f = fe_selftest_yield();     g_selftest_failures += f;
+    fe_kprintf("        => 让出代价失败项: %u\n", f);
+    fe_kprintf("\n");
     fe_kprintf("[自检] 按需分页与栈增长（VMA + #PF 解析）:\n");
     f = fe_selftest_demand_paging(); g_selftest_failures += f;
     fe_kprintf("        => 按需分页失败项: %u\n", f);
