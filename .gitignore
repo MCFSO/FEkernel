@@ -1,0 +1,18 @@
+﻿# 构建产物与现场证据（不入库；回滚请用 git，不要再用 build/backup 手工快照）
+build/
+
+# 便携工具链与引导器：下载物，不是维护源码（见 tools/fetch_toolchain.py）
+toolchain/
+
+# 第三方代码：各自保留自己的许可证，见 third_party/README.md
+third_party/*
+!third_party/README.md
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 编辑器与系统杂物
+.vscode/
+.idea/
+Thumbs.db

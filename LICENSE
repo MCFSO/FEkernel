@@ -1,0 +1,31 @@
+Copyright (C) 2026 FEKernel contributors
+
+Permission to use, copy, modify, and/or distribute this software for any
+purpose with or without fee is hereby granted.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY
+AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM
+LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR
+OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+PERFORMANCE OF THIS SOFTWARE.
+
+---
+
+FEKernel 采用 0BSD（BSD Zero Clause License）。
+
+0BSD 是 OSI 认可的最宽松许可证之一：它连「保留版权声明」的义务都没有，
+等于把代码放进公有领域并附带免责声明。选它的理由与项目结构有关：
+
+  * 本项目计划让**其他人**来编写用户态驱动服务。0BSD 不附加任何义务，
+    因此无论那些服务采用什么许可证（包括 GPL-2.0），都不会与内核许可证冲突；
+  * 微内核架构下驱动是本内核之外的独立进程，通过 IPC 通信 ——
+    这正是「内核保持宽松、驱动各自选择许可证」在技术上的实现方式。
+
+关于第三方组件：
+  * 镜像中随附的 Limine 引导器（BOOTX64.EFI 等）由 Limine 项目提供，
+    采用 BSD-2-Clause 许可证，其版权声明见 toolchain/limine/LICENSE，
+    分发镜像时需一并保留。BSD-2-Clause 是宽松许可证，不会影响本项目的授权。
+  * 除引导器之外，内核、驱动、文件系统与协议栈的代码均为本项目自研，
+    未包含任何其他内核的代码。
