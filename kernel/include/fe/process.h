@@ -183,6 +183,15 @@ u32 fe_task_wait_others_dead(struct fe_task *task, u32 max_rounds);
  * 它登记的等待点）+ 一行明说"这个进程已经残缺"。 */
 void fe_task_dump_stuck_threads(struct fe_task *task, struct fe_thread *keep);
 
+/* ★ 自检的探针收尾：把一组探针叫停、等它们死透，并如实报告清不掉的那些 ★
+ *
+ * 自检造出来的探针不许活得比自检久：它们会污染后续自检，而且"永久自旋/
+ * 永久阻塞的探针活得比任务久"正是悬空 task 指针最可能的来源。
+ * 返回清不掉的探针数（0 = 全清干净），并打一行 `收尾：…`；
+ * 清不掉的逐个点名（取消是协作式的，没有取消点的等待清不掉——
+ * 见 docs/13-tasks-and-kill.md §6.3）。 */
+u32 fe_task_cleanup_probes(struct fe_task *task, const char *tag);
+
 /* 内核从 cmdline 解析出的引导槽（'a' 或 'b'；没有 cmdline 时是 'a'）。
  * 它同时决定 exec 哪个 init、以及 A/B 访问矩阵里哪个槽"正在运行"。 */
 char fe_boot_slot(void);

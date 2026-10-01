@@ -890,6 +890,11 @@ static u32 selftest_d2_reslock(void)
             }
         }
     }
+    /* ★ 收尾（第 4 步的变量）★ 探针不许活得比自检久。
+     * `d2-ctrl` 今天**清不掉**：它卡在 `fe_resource_lock` 上，而那处的
+     * 取消点正是 D2 还没修的缺陷。如实点名，不算失败。 */
+    fe_task_cleanup_probes(p, "D2① 受害者");
+    fe_task_cleanup_probes(r, "D2① 对照");
     fe_object_unref(&p->hdr);
     fe_object_unref(&r->hdr);
     return fail;
@@ -1024,6 +1029,14 @@ static u32 selftest_d4_forget(void)
     /* 收尾：keep 自己放掉那两把锁，免得被后面的校验当成漏掉的。 */
     fe_resource_unlock(FE_RES_IOPORT, 0x90, 4, 0);
     fe_resource_unlock(FE_RES_IOPORT, 0x94, 4, 0);
+    /* ★ 收尾（第 4 步的变量）★ 探针不许活得比自检久：
+     *   - `d4-vhold` 是**永久自旋**的（`for(;;) fe_thread_yield();`）——
+     *     它是这一刀最该被收掉的那个（一直在烧 CPU、还握着一把锁）；
+     *   - `d4-z` 卡在 `fe_resource_lock` 上，与 `d2-ctrl` 一样**清不掉**
+     *     （没有取消点），如实点名。 */
+    fe_task_cleanup_probes(t, "D4 受害者");
+    fe_task_cleanup_probes(v, "D4 对照持锁者");
+    fe_task_cleanup_probes(z, "D4 后来者");
     fe_object_unref(&t->hdr);
     fe_object_unref(&v->hdr);
     fe_object_unref(&z->hdr);

@@ -666,6 +666,8 @@ u32 fe_selftest_kill(void)
                 fe_kprintf("        D1 修复后：取消之后 nt->waiter 已被摘成 NULL\n");
             }
         }
+        /* ★ 收尾 ★ d1-waiter 已被杀停；这里确认没有残留。 */
+        fe_task_cleanup_probes(task, "D1");
         fe_object_unref(&task->hdr);
         fe_handle_close(&fe_task_current()->handles, keep_h);
 
@@ -710,6 +712,9 @@ u32 fe_selftest_kill(void)
                         fe_kprintf("        D1 反向①：等待者没有登记上\n");
                         fail++;
                     }
+                    /* ★ 收尾 ★ d1-normal 自己 fe_thread_exit 退出了，这里
+                     * 只是确认没有残留（0 个也照样打一行，让"清过了"可观察）。 */
+                    fe_task_cleanup_probes(t2, "D1 反向");
                     fe_object_unref(&t2->hdr);
                 }
             } else {
@@ -801,6 +806,10 @@ u32 fe_selftest_kill(void)
             /* 反向对照：目标任务上的 waiter 槽不许留着已死的线程 */
             CHECK(child->waiter == NULL);
         }
+        /* ★ 收尾（第 4 步的变量）★ 探针不许活得比自检久。
+         * 清不掉的**不算失败**——取消是协作式的，没有取消点的等待本来就
+         * 清不掉（那正是 D2/D3 要修的缺陷），这里只如实点名。 */
+        fe_task_cleanup_probes(task, "D2②");
         fe_object_unref(&task->hdr);
         fe_object_unref(&child->hdr);
     }
@@ -904,6 +913,10 @@ u32 fe_selftest_kill(void)
                            "变成 DEAD（轮询看得见睡到点）\n", ctl_round * 5u);
             }
         }
+        /* ★ 收尾 ★ 两个"s 睡 60 s"的探针今天**清不掉**（fe_sched_wake 不叫醒
+         * SLEEPING，那正是 D3 的缺陷本身）——如实点名，不算失败。 */
+        fe_task_cleanup_probes(task, "D3 受害者");
+        fe_task_cleanup_probes(ctl,  "D3 对照");
         fe_object_unref(&task->hdr);
         fe_object_unref(&ctl->hdr);
     }

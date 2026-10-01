@@ -539,6 +539,52 @@ void fe_task_dump_stuck_threads(struct fe_task *task, struct fe_thread *keep)
                " no rollback)\n");
 }
 
+/* ★ 自检的探针收尾：把一组探针叫停、等它们死透，并如实报告清不掉的那些 ★
+ *
+ * ★ 为什么自检必须做收尾（这是纪律，不是礼貌）★
+ * 自检造出来的探针线程如果留在系统里继续跑，会同时污染两件事：
+ *   1. **后续的自检**（线程表、节拍统计、就绪队列的形态全都被它们影响）；
+ *   2. **"线程比任务活得久"这类场景**——一个永久自旋/永久阻塞的探针，
+ *      在它所属的任务被销毁之后仍然活着，它的 task 字段就成了悬空指针。
+ * 所以：跑完就把它们标记杀掉、等它们死透。
+ *
+ * ★ 为什么会有"清不掉"的 ★ 取消是**协作式**的（线程只在取消点上死，
+ * 见 docs/13-tasks-and-kill.md §3.2/§3.3）。今天有两类等待**没有取消点**：
+ *   - 睡在很长的 SLEEP 上（`fe_sched_wake` 还不叫醒 SLEEPING，§6.3（2））；
+ *   - 卡在共享区间的控制器锁上（`fe_resource_lock` 循环顶没有判据，§6.3 表第 4 行）。
+ * 它们要等对应的修复落地才清得掉。**如实点名打出来**，不要假装清干净了
+ * ——"清不掉"本身是一条要被看见的事实。
+ *
+ * 返回清不掉的探针数（0 = 全清干净）。 */
+u32 fe_task_cleanup_probes(struct fe_task *task, const char *tag)
+{
+    if (!task) {
+        return 0;
+    }
+    u32 marked = fe_task_kill_other_threads(task, NULL);
+    /* 给被标记的探针几次调度机会：它们要么走到闸门、要么走进取消点。
+     * 用"睡 2 ms"而不是"让出"——让出只在当前线程自己的时间片里转，
+     * 被唤醒的线程可能一次都选不上（实测过）。 */
+    for (u32 i = 0; i < 50 && fe_task_thread_count(task) > 0; i++) {
+        fe_thread_sleep_ms(2);
+    }
+    u32 left = fe_task_thread_count(task);
+    if (left == 0) {
+        fe_kprintf("        收尾：%s 的 %u 个探针已清理\n", tag, marked);
+        return 0;
+    }
+    fe_kprintf("        收尾：%s 标记了 %u 个，仍有 %u 个**清不掉**"
+               "（卡在没有取消点的等待或长睡眠上，要等对应修复）:\n",
+               tag, marked, left);
+    for (struct fe_thread *t = fe_task_thread_first(task); t;
+         t = fe_thread_next_of(t)) {
+        fe_kprintf("          残留：name=%s id=%llu state=%u wait=%s\n",
+                   t->name, (unsigned long long)t->id, t->state,
+                   fe_thread_wait_site(t));
+    }
+    return left;
+}
+
 /* ★ 这里做的是"标记 + 唤醒"，不是"就地拔掉" ★
  *
  * 一个线程可能正卡在内核里（阻塞在端点的等待表或 wait_any 的节点上）。

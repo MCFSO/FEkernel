@@ -99,11 +99,6 @@ static struct fe_thread *rq_pick(void)
     if (t) {
         rq_remove(t);
     }
-    /* [tmpdbg] 取证：队列里不该有 DEAD 线程。 */
-    if (t && t->state == FE_THREAD_DEAD) {
-        fe_kprintf("[dbg] rq_pick 选中 DEAD 线程 %s(id=%llu) task=%p\n",
-                   t->name, (unsigned long long)t->id, (void *)t->task);
-    }
     return t;
 }
 
@@ -448,16 +443,6 @@ u64 fe_sched_maybe_switch(u64 rsp)
      * 是因为"留着"意味着内核线程一旦误用 %fs 就会读到别的进程的 TLS——
      * 那是信息泄漏；而 0 会让它当场 #PF，暴露问题而不是掩盖问题。 */
     fe_wrmsr(FE_MSR_FS_BASE, next->user_fs_base);
-    /* [tmpdbg] 取证：只在 task 对象头**不像活任务**时打一行
-     * （活任务：type=4 FE_OBJ_TASK、refcount >= 1）。读对象头偏移 0/4
-     * 是安全的；出错的读在 +0x1060。 */
-    if (next->task &&
-        (next->task->hdr.type != FE_OBJ_TASK || next->task->hdr.refcount == 0)) {
-        fe_kprintf("[dbg] **switch-> %s(id=%llu) 的 task=%p 不像活任务**"
-                   "hdr{type=%u ref=%u}\n", next->name,
-                   (unsigned long long)next->id, (void *)next->task,
-                   next->task->hdr.type, next->task->hdr.refcount);
-    }
     /* 端口权限跟着任务走：只改 TSS 里的 iopb_offset，不搬 8 KiB 位图。
      * 内核线程（task 为 NULL）一律按「禁止一切端口」处理。 */
     fe_tss_set_iopb_slot(next->task ? next->task->iopb_slot : -1);
@@ -750,16 +735,6 @@ static void thread_free(struct fe_thread *t)
 {
     if (!t) {
         return;
-    }
-    /* [tmpdbg] 取证：被释放的线程绝不该还挂在任何就绪队列上。 */
-    for (u32 p = 0; p < FE_THREAD_PRIO_LEVELS; p++) {
-        for (struct fe_thread *q = g_runq[p].head; q; q = q->rq_next) {
-            if (q == t) {
-                fe_kprintf("[dbg] **thread_free 释放的线程 %s(id=%llu state=%u)"
-                           " 仍挂在就绪队列 prio=%u 上**\n", t->name,
-                           (unsigned long long)t->id, t->state, p);
-            }
-        }
     }
     if (t->stack_base) {
         fe_kfree(t->stack_base);
