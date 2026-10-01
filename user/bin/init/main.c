@@ -774,6 +774,30 @@ static struct unit g_units[] = {
     { .name = "killtest", .path = "/bin/killtest", .expect = 0, .check = 1,
       .require = { "/dev/fs0", NULL } },
 
+    /* 替换映像（K6）+ 区间保护（mprotect）的**用户态运行期**验证（2c）。
+     *
+     * ★ 为什么是**三个**单元，而不是一个 ★
+     * 一个进程只能有一个退出码：模式 A 成功时进程**变成**了子模式
+     * （exit 0x5A），模式 C 成功时变成 chain3（exit 0x5C）——
+     * 两者都想让 init 校验自己的退出码，就只能各占一次调用。
+     * 把三种模式压进一次调用，"两个退出码"在物理上不可能同时成立
+     * （第一版就是这样，结果模式 A 那段代码永远跑不到）。
+     *
+     * ★ 三个单元都 require /dev/fs0，而且**都没有 needs** ★
+     * exectest 的核心动作就是 `fe_exec` **按路径装载自己**（探针还要
+     * spawn 自己当孩子），所以没有文件系统它无从谈起；
+     * 而它不依赖任何硬件——只用 ramfs 里的映像，所以两个环境
+     * （QEMU 与 VirtualBox）都必须真的跑起来。按 needs 跳过它，
+     * 等于把"提交路径只有编译级保证"这个空白又留回去（docs/15 §10.3）。 */
+    { .name = "exectest", .path = "/bin/exectest", .expect = 0x5A, .check = 1,
+      .require = { "/dev/fs0", NULL } },
+    { .name = "exectest-rb", .path = "/bin/exectest", .expect = 0x5B, .check = 1,
+      .args = { "--rollback", NULL },
+      .require = { "/dev/fs0", NULL } },
+    { .name = "exectest-ch", .path = "/bin/exectest", .expect = 0x5C, .check = 1,
+      .args = { "--chain", NULL },
+      .require = { "/dev/fs0", NULL } },
+
     /* --- 常驻服务 --- */
     { .name = "blkd",  .path = "/sbin/blkd",  .provides = "/dev/blk0", .daemon = 1,
       /* 参数在启动前由 busmaster_probe 回填（端口是**运行时发现**出来的）：

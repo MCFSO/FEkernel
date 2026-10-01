@@ -25,5 +25,10 @@ const char *fe_exception_name(u64 vector);
  * 自检用它区分「被 #GP 挡下来了」与「因为别的原因碰巧也失败了」。 */
 u64 fe_last_user_fault_vector(void);
 u64 fe_user_fault_count(void);
+/* 按向量分别计数（2c 加的）：判据该说"#GP **发生过**"，而不是
+ * "最后一次是 #GP"——后者把断言押在异常发生的**顺序**上，
+ * 而顺序不是被验的性质（exectest 的 mprotect 探针会故意制造一次 #PF，
+ * 见 kernel/task/user.c 的 fe_selftest_user）。 */
+u64 fe_user_fault_count_of(u32 vector);
 
 #endif /* FE_IDT_H */

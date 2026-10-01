@@ -300,6 +300,14 @@ long fe_spawn(const char *path, char *const argv[], u32 argc)
     return fe_syscall(FE_SYS_PROCESS_SPAWN, (long)path, (long)argv, (long)argc, 0, 0, 0);
 }
 
+/* ★ 成功时**不返回**（内核改的是这次 syscall 的返回帧）★
+ * 走到 `return` 那一行只可能是失败。包装形式与 fe_spawn 一样，
+ * 语义完全不同，所以把"不返回"写在代码旁边而不是只写在头文件里。 */
+long fe_exec(const char *path, char *const argv[], u32 argc)
+{
+    return fe_syscall(FE_SYS_EXEC, (long)path, (long)argv, (long)argc, 0, 0, 0);
+}
+
 long fe_wait(long task_handle, int *out_status)
 {
     return fe_syscall(FE_SYS_PROCESS_WAIT, task_handle, (long)out_status, 0, 0, 0, 0);

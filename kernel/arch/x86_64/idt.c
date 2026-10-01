@@ -220,6 +220,7 @@ static FE_NORETURN void exception_fatal(struct fe_regs *r)
  * 「被 #GP 挡下来了」和「因为别的原因碰巧也返回 -1」。 */
 static u64 g_last_user_fault_vector = ~0ull;
 static u64 g_user_fault_count;
+static u64 g_user_fault_by_vec[32]; /* 按向量分别计数（见 fe_user_fault_count_of） */
 static u64 g_pf_resolved;           /* 被按需分页消化掉的缺页次数（诊断） */
 
 u64 fe_last_user_fault_vector(void)
@@ -230,6 +231,22 @@ u64 fe_last_user_fault_vector(void)
 u64 fe_user_fault_count(void)
 {
     return g_user_fault_count;
+}
+
+/* ★ 按向量分别计数（2c 加的）★
+ *
+ * ★ 为什么"最近一次向量"不够用了 ★
+ * `fe_selftest_user` 原来只看 `fe_last_user_fault_vector()`，因为那时
+ * 用户态**只该**有 drvdeny 那一次 #GP。2c 之后不是了：exectest 的
+ * mprotect 探针**故意**让一个孩子写只读页，那是一次**预期之内**的 #PF。
+ * 于是"最近一次"变成了 14，#GP 那条断言就假失败了——而它测的性质
+ * （越权的 in 被 CPU 拒成 #GP）完全没变。
+ *
+ * 判据应该是"**发生过**一次 #GP"，不是"最后一次是 #GP"：
+ * 后者把断言押在"异常发生的顺序"上，而顺序不是被验的性质。 */
+u64 fe_user_fault_count_of(u32 vector)
+{
+    return (vector < 32u) ? g_user_fault_by_vec[vector] : 0;
 }
 
 u64 fe_pf_resolved_count(void)
@@ -261,6 +278,9 @@ static void user_fault(struct fe_regs *r)
 
     g_last_user_fault_vector = r->vector;
     g_user_fault_count++;
+    if (r->vector < 32u) {
+        g_user_fault_by_vec[r->vector]++;
+    }
     fe_kprintf("\n[用户态异常] 线程 %s 触发 %s (向量 %llu, 错误码 %#llx)\n",
                tname, fe_exception_name(r->vector), (unsigned long long)r->vector,
                (unsigned long long)r->error);

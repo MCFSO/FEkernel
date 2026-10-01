@@ -26,7 +26,18 @@
 /* init 跑完之后核对：drvdeny 那个故意越权的程序，必须是被 #GP 打死的。
  *
  * 内核能看到的证据比用户态强：用户态只看得见退出码 -1，而别的异常碰巧
- * 也会返回 -1；内核直接看异常向量，13 就是 13。 */
+ * 也会返回 -1；内核直接看异常向量，13 就是 13。
+ *
+ * ★ 判据从"最近一次"改成"**发生过**一次 #GP"（2c 改的）★
+ * 2c 之前用户态**只该**有这一次异常，所以"最近一次向量 == 13"成立。
+ * 2c 之后 exectest 的 mprotect 探针会**故意**制造一次 #PF
+ * （让一个孩子写只读页——那正是"PTE 的 W 位真的掉了"的判据），
+ * 于是"最近一次"变成 14，这条断言就假失败了，而它要测的性质
+ * （越权的 `in` 被 CPU 拒成 #GP）一个字都没变。
+ *
+ * 所以判据改成"#GP 出现过至少一次"：被验的性质是"那次越权**被拒了**"，
+ * 而"异常发生的顺序"不是被验的性质——把断言押在顺序上，
+ * 每加一个会触发异常的测试它就会假红一次。 */
 u32 fe_selftest_user(void)
 {
     u32 fail = 0;
@@ -34,15 +45,20 @@ u32 fe_selftest_user(void)
         fe_kprintf("        没有任何用户态异常——drvdeny 应当触发一次 #GP\n");
         return 1;
     }
-    u64 vec = fe_last_user_fault_vector();
-    if (vec != 13) {
-        fe_kprintf("        最近一次用户态异常向量是 %llu，期望 13 (#GP)\n",
-                   (unsigned long long)vec);
+    u64 gp = fe_user_fault_count_of(13);
+    if (gp == 0) {
+        fe_kprintf("        用户态异常里**没有** #GP（最近一次向量 %llu，共 %llu 次）"
+                   "——期望 drvdeny 的越权 in 被 CPU 拒成 #GP\n",
+                   (unsigned long long)fe_last_user_fault_vector(),
+                   (unsigned long long)fe_user_fault_count());
         fail++;
     } else {
-        fe_kprintf("        用户态异常向量 = 13 (#GP)，累计 %llu 次 —— 未认领端口的 in "
-                   "被 CPU 逐条指令拒绝\n",
-                   (unsigned long long)fe_user_fault_count());
+        fe_kprintf("        用户态 #GP 累计 %llu 次（向量 13）——未认领端口的 in "
+                   "被 CPU 逐条指令拒绝；用户态异常总计 %llu 次"
+                   "（#PF %llu 次，其中含 exectest 探针故意触发的那次）\n",
+                   (unsigned long long)gp,
+                   (unsigned long long)fe_user_fault_count(),
+                   (unsigned long long)fe_user_fault_count_of(14));
     }
     return fail;
 }

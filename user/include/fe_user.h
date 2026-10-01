@@ -104,6 +104,16 @@
 #define FE_SYS_CLOCK_INFO        0x8D
 #define FE_SYS_IRQ_MSI_ALLOC     0x8E
 #define FE_SYS_IRQ_MSI_FREE      0x8F
+/* ★ 替换**当前程序**的映像（K6）★
+ *
+ * ★ 成功时**不返回** ★ 内核改的是这次 syscall 的返回帧（rip/rsp/rflags），
+ * 于是"回到用户态"直接落在新映像的入口上。所以调用它**必须**按
+ * "不会返回"来写：真正的返回值只有一种——失败时返回负错误码，
+ * 那时**原程序继续跑**。
+ *
+ * 参数形状与 fe_spawn 完全一致（path/argv/argc）；argv[0] 由调用者给，
+ * 内核不替它填。 */
+#define FE_SYS_EXEC             0x90
 
 /* 资源类别（与内核 fe/syscall.h 一致） */
 #define FE_RES_IOPORT 1u
@@ -648,6 +658,28 @@ void           fe_outl(unsigned short port, unsigned int val);
  * 「谁都能 kill/wait 别人」的那个问题。wait 阻塞到目标进程结束并取回退出码。 */
 long fe_spawn(const char *path, char *const argv[], u32 argc);
 long fe_wait(long task_handle, int *out_status);
+
+/* ★ 用新映像替换**当前程序**（K6 / FE_SYS_EXEC）★
+ *
+ * 身份不变、映像变：句柄表 / 设备认领 / devfs 名字 / 任务 id / 父子关系
+ * 一个字都不动，换掉的是地址空间、区间表、返回帧里的入口与栈，
+ * 以及调用线程的 TLS 块与 FPU 状态区。
+ *
+ * ★ ★ 成功时**不返回** ★ ★
+ * 所以**不要**写成 `if (fe_exec(...) == 0)`——成功那条路上根本回不到这里。
+ * 唯一会返回的情形是失败：返回负错误码，**原程序继续跑**（准备阶段的
+ * 任何失败都不碰任务对象）。正确的写法是：
+ *
+ *     long e = fe_exec(path, argv, argc);
+ *     fprintf(stderr, "exec 失败: %ld\n", e);   // 走到这行 = 失败
+ *     return 1;
+ *
+ * ★ 两个必须知道的后果 ★
+ *   1. **所有用户映射丢失**（那是新地址空间），要重新 `mmap`；
+ *   2. 多线程进程会被先杀掉其它线程，而那一步**不可回滚**——
+ *      超时（FE_ERR_TIMEOUT）之后进程已经少了线程。
+ * 设计与代价见 docs/15-exec.md。 */
+long fe_exec(const char *path, char *const argv[], u32 argc);
 
 /* 终止一个任务（K2）。成功返回 FE_OK。
  *
