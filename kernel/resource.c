@@ -15,6 +15,7 @@
 #include <fe/io.h>
 #include <fe/task.h>
 #include <fe/process.h>     /* D 组要用 fe_task_kill_other_threads / 等待死透 */
+#include <fe/time.h>        /* fe_time_ms：DI 组的有界等待用绝对时间上界 */
 
 #define FE_RES_FLAG_SHARED 1u
 
@@ -969,8 +970,18 @@ static u32 selftest_d4_forget(void)
              * （反向对照的"持锁线程自己退出"是缺陷期的另一条复现路径，
              *   两条在"锁卡住"这个结局上是同一个状态。） */
             CHECK(fe_task_kill_other_threads(t, fe_thread_current()) == 2);
-            CHECK(fe_ok(fe_task_wait_others_dead(t, 20000)));
-            /* 有界窗口：把 CPU 让出去，让"死在闸门 / 走到取消点"发生完。 */
+            /* ★ 有界（绝对时间）等待，不用 fe_task_wait_others_dead 的
+             * 20000 轮纯让出 ★ 理由见 killtest.c 里 wait_task_clear 的说明：
+             * 让出轮数在"被饿"时不是时间（实测 main 每 100 个节拍只拿到
+             * 10 个节拍），那会把"跑不完"伪装成"挂死"。 */
+            {
+                u64 wd_deadline = fe_time_ms() + 200u;
+                while (fe_task_thread_count(t) > 0 &&
+                       fe_time_ms() < wd_deadline) {
+                    fe_thread_sleep_ms(1);
+                }
+            }
+            /* 有界窗口：让"死在闸门 / 走到取消点"发生完。 */
             for (u32 i = 0; i < 20 && (a->state != FE_THREAD_DEAD ||
                                        b->state != FE_THREAD_DEAD); i++) {
                 fe_thread_sleep_ms(2);

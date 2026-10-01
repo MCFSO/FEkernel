@@ -30,6 +30,7 @@
 #include <fe/sched/thread.h>
 #include <fe/ipc.h>
 #include <fe/process.h>
+#include <fe/time.h>            /* fe_time_ms：等待用绝对时间上界，不用让出轮数 */
 #include <fe/object.h>
 #include <fe/kprintf.h>
 #include <fe/string.h>
@@ -187,6 +188,64 @@ static struct fe_thread *spawn_probe_arg(struct fe_task *task, const char *name,
 
 /* 等一个 volatile 标志变真，最多等 rounds 轮让出。 */
 /* （wait_flag 在下面；这里再加一个"真的睡"的版本给时间窗口用。） */
+
+/* ★ 自检的等待必须用**绝对时间上界**，不能用"让出轮数" ★
+ *
+ * ★ 为什么（实测，第 6 步）★ 纯让出的循环在"只有 idle 可跑"时会被饿：
+ * 让出之后本线程重新入队，但下一个被选中的往往是 idle，而它要跑满一个
+ * 时间片（10 个节拍）才让位——实测 `main` 每 100 个节拍只拿到 10 个节拍
+ * （≈10% CPU）。于是自检里那些 "20000 次让出" 的等待循环要花约 200 秒，
+ * 远超 QEMU 的运行窗口，**把"跑不完"伪装成"挂死"**（我们为此追了三轮）。
+ * 轮数在"被饿"的情况下不是时间；**时间才是时间**。
+ *
+ * 做法：每轮真的睡 1 ms（睡会把 CPU 交出去，而节拍一定会把我们叫醒——
+ * 唤醒不依赖别的线程是否让出），循环条件用 `fe_time_ms()` 的绝对上界。 */
+#define SELFTEST_WAIT_MS 200u
+
+/* 等到某任务里只剩下不超过 keep 个存活线程（keep=0 表示等它清空）。 */
+static int wait_task_clear(struct fe_task *t, u32 keep, u32 ms)
+{
+    u64 deadline = fe_time_ms() + ms;
+    for (;;) {
+        if (fe_task_thread_count(t) <= keep) {
+            return 1;
+        }
+        if (fe_time_ms() >= deadline) {
+            return 0;
+        }
+        fe_thread_sleep_ms(1);
+    }
+}
+
+/* 等一个 volatile 标志变真，上界是绝对时间。 */
+static int wait_flag_ms(volatile u32 *flag, u32 ms)
+{
+    u64 deadline = fe_time_ms() + ms;
+    for (;;) {
+        if (*flag) {
+            return 1;
+        }
+        if (fe_time_ms() >= deadline) {
+            return 0;
+        }
+        fe_thread_sleep_ms(1);
+    }
+}
+
+/* 等一个线程落到某个状态（绝对时间上界）。 */
+static int wait_state_ms(struct fe_thread *t, u32 want, u32 ms)
+{
+    u64 deadline = fe_time_ms() + ms;
+    for (;;) {
+        if (!t || t->state == want) {
+            return t ? 1 : 0;
+        }
+        if (fe_time_ms() >= deadline) {
+            return 0;
+        }
+        fe_thread_sleep_ms(1);
+    }
+}
 
 /* 与 wait_flag 同一件事，但**每一轮睡 5 ms**。
  *
@@ -652,7 +711,10 @@ u32 fe_selftest_kill(void)
              * 这个任务只有 w 一个线程，keep 传自检自己的线程（它不属于这个
              * 任务，所以遍历不到）：标记数必须是 1，而且**自检自己不受影响**。 */
             CHECK(fe_task_kill_other_threads(task, fe_thread_current()) == 1);
-            CHECK(fe_ok(fe_task_wait_others_dead(task, 20000)));
+            /* ★ 用有界（绝对时间）等待，不用 fe_task_wait_others_dead 的
+             * 20000 轮纯让出 ★ 理由见 wait_task_clear 的说明：让人出轮数
+             * 在"被饿"时不是时间，会把"跑不完"伪装成"挂死"。 */
+            CHECK(wait_task_clear(task, 0, SELFTEST_WAIT_MS));
             CHECK(fe_task_thread_count(task) == 0);
             /* ★ 被测的那一条 ★ 受害者死透之后 nt->waiter 必须已经被摘掉。
              * 没修之前没人摘 ⇒ 非 NULL ⇒ 失败。
@@ -698,11 +760,11 @@ u32 fe_selftest_kill(void)
                     if (w2 && wait_flag_sleep(&g_d1_entered, 20) &&
                         nt2->waiter == w2) {
                         fe_notification_signal_obj(nt2, 0x1);
-                        u32 done = 0;
-                        for (u32 i = 0; i < 20000 && !done; i++) {
-                            fe_thread_yield();
-                            done = (g_d1_status != 0);
-                        }
+                        /* ★ 原来是 20000 轮纯让出 —— 正是它把这一轮拖成
+                         * "跑不完"（实测每次让出要等 idle 一个时间片）。
+                         * 改成绝对时间上界。 */
+                        wait_flag_ms((volatile u32 *)&g_d1_status,
+                                     SELFTEST_WAIT_MS);
                         CHECK(g_d1_status == FE_OK);
                         CHECK(nt2->waiter == NULL);
                         fe_kprintf("        D1 反向①：正常唤醒会清掉槽"
@@ -774,13 +836,10 @@ u32 fe_selftest_kill(void)
             CHECK(g_d2_wait_done == 0);
             CHECK(child->exited == false);
             CHECK(fe_task_kill_other_threads(task, fe_thread_current()) == 1);
-            u32 waited = fe_task_wait_others_dead(task, 20000);
-            /* ★ 再给一个有界窗口：wait_others_dead 的让出**不保证**唤醒的
-             * 线程被选中（实测：它可能一直停在就绪队列上，直到某个节拍把它
-             * 推上去）。 */
-            for (u32 i = 0; i < 20 && fe_task_thread_count(task) != 0; i++) {
-                fe_thread_sleep_ms(2);
-            }
+            /* ★ 有界（绝对时间）等待：原来这里是 fe_task_wait_others_dead
+             * 的 20000 轮纯让出，那正是把整轮拖成"跑不完"的地方。 */
+            u32 waited = wait_task_clear(task, 0, SELFTEST_WAIT_MS) ? FE_OK
+                                                                    : FE_ERR_TIMEOUT;
             u32 alive = fe_task_thread_count(task);
             /* ★ 缺陷期的形态 ★ 受害者死在闸门上，而这次 fe_process_wait
              * **永远不返回**——循环顶没有取消判据，它留在 child->waiter 上的
