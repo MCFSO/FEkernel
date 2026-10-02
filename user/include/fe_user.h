@@ -131,6 +131,24 @@
 #define FE_SYS_FAULT_HANDLER    0x92
 #define FE_SYS_FAULT_REPLY      0x93
 
+/* ★ 等一个用户地址（K11）★ 与内核 fe/syscall.h 的
+ * `FE_SYS_WAIT_ADDR` / `FE_SYS_WAKE_ADDR` 逐个对应。
+ *
+ * 它们是 `pthread_mutex_*` / `pthread_cond_*` / `pthread_once` / `sem_*`
+ * 那条链的**底座**：标准要求"原子地检查条件并睡下、被唤醒后重新检查"，
+ * 而用户态排不出那个原子步（检查与睡下之间总有窗口，落在那里的唤醒会丢）。
+ *
+ * ★ 名字里没有 `futex` ★ 那是 Linux 的接口名，我们要的是标准要求的**语义**；
+ * 号与形状都是我们自己的（docs/20 §1.2.5、docs/21 §1.3）。Linux 那套附加
+ * 操作（PI / requeue / robust list / BITSET / `FUTEX_FD`）**一个都不做**。
+ *
+ * ★ 超时用**绝对**单调纳秒 ★（`fe_clock_ns()` 那条时钟；0 = 无限等）。
+ * 精度是**一个节拍的真实长度**，而它在两个环境里差 12 倍：QEMU+WHPX 实测
+ * 998–999 Hz（≈1 ms），VirtualBox 实测 **79 Hz（≈12.6 ms）**。
+ * 所以超时**只会晚、不会早**；写判据时按最差的那个环境写。 */
+#define FE_SYS_WAIT_ADDR        0x94
+#define FE_SYS_WAKE_ADDR        0x95
+
 /* 处理者的决定（FE_SYS_FAULT_REPLY 的第一个参数）。低 4 位是动作。 */
 #define FE_FAULT_ACTION_MASK    0xFu
 #define FE_FAULT_RESUME         1u    /* 已处理：按我给的现场继续跑 */
@@ -784,6 +802,44 @@ long fe_fault_set_handler(long ep_handle, struct fe_fault_regs *regs);
  *
  * ★ 只有 RESUME 会让出错线程继续跑 ★ KILL / RETHROW 都不会。 */
 long fe_fault_reply(u64 verdict, struct fe_fault_regs *regs);
+
+/* ★ 等一个用户地址（K11 的两个原语）★
+ *
+ *   fe_wait_addr(addr, expected, deadline_ns)
+ *       等 `*addr` 这个 u32 **不再等于** `expected`。
+ *         `addr` 必须 4 字节对齐（否则 -1）；
+ *         `deadline_ns` 是**绝对**单调纳秒（`fe_clock_ns()`），0 = 无限等。
+ *       返回：
+ *          0   被唤醒 —— ★ **必须自己重查条件** ★ 内核不保证为什么醒；
+ *         -5   值不等于期望，**我一次都没睡**（futex 的 EAGAIN：你给我的
+ *              期望值已经不对了）；
+ *        -12   到点（只会**晚**于 deadline，不会早：见上面的精度说明）；
+ *         -7   地址读不了（没映射/不可读）——**不是**"值不相等"；
+ *        -21   这次等待被取消（线程被要求去死 / 任务被终止）；
+ *         -1   参数非法（空指针、没对齐）。
+ *
+ *   fe_wake_addr(addr, count)
+ *       唤醒**本进程**里等在 `addr` 上的至多 `count` 个线程，`count == 0` = 全部。
+ *       返回实际唤醒的个数；唤醒一个没人等的地址返回 **0**（不是错）。
+ *
+ * ★ 正确用法只有一个形状 ★ 它是一个**等待原语**，不是"读一个值"：
+ *
+ *       lock(m);                       // 条件由这把锁保护
+ *       u32 s = seq;                   // 持锁时读代际号
+ *       unlock(m);
+ *       fe_wait_addr(&seq, s, deadline);   // 醒来就返回，无论为什么
+ *       lock(m);
+ *       // 回到循环顶部**重查条件**
+ *
+ *   写成 `if (fe_wait_addr(...) == 0) 就认为条件成立` **必然是错的**：
+ *   唤醒只是"点名"，条件的真假只有重查才知道。
+ *
+ * ★ 键是 (地址空间, 地址) ★ 唤醒只作用于**自己进程**里的等待者——别的进程
+ * 在同一个虚拟地址上等的，一个都不会被唤醒。
+ *
+ * 设计与代价（含"什么时候会咬人"）见 docs/21-user-address-wait.md。 */
+long fe_wait_addr(u32 *addr, u32 expected, u64 deadline_ns);
+long fe_wake_addr(u32 *addr, u32 count);
 
 /* 终止一个任务（K2）。成功返回 FE_OK。
  *

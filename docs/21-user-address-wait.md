@@ -177,7 +177,7 @@ K11 的调用者是**明确的**（`pthread_*` 那一族），而它只需要**�
 | 窗口 2 会发生什么（读代码） | 唤醒被丢弃 → 等待者随后 `state = BLOCKED` + 让出 → **没人再叫它**。有粘性位的对象（通知）也救不了：位还在对象里，但**没有人再检查它** |
 | 窗口 2 有没有被实测命中过 | ★ **没有** ★ `build/serial.log`、`build/vbox-serial.log`、`build/serial-ref.txt` 三份里那条诊断 **0 处**。窗口只有几条指令宽，所以"没命中"是预期的，**但它不是零** |
 | 窗口 1 的宽度 | 宽得多：`wait_target_ready` 要查句柄表、在 `FE_WAIT_MSG` 分支里还可能 `memcpy` 最多 1024 字节（`ipc.c:588-654`）。★ 但它今天**打不到任何人**：`fe_wait_any` 的调用者只有内核自检（`ipc/ipctest.c`、`task/exectest.c`），**没有用户态 ABI**（`20` §2.9）★ |
-| `wait_satisfied` 这个字段 | ★ **被写、从来没有被读** ★ 写点两处：`ipc.c:580`（唤醒方）与 `ipc.c:757`（等待方清零）；全仓**没有一个读者**。也就是说"处理'提前被唤醒'"这个意图**没有落地**，只留下一个字段 |
+| `wait_satisfied` 这个字段 | ★ **原先（写这份设计时）：被写、从来没有被读** ★ 写点两处：`ipc.c:580`（唤醒方）与 `ipc.c:757`（等待方清零）；全仓**没有一个读者**——"处理提前被唤醒"这个意图没有落地，只留下一个字段。★★ **这一条在 5a 落地时被接上了：它现在有真实读者** ★★ —— `fe_wake_addr` 写 `wait_satisfied = 1`，等待者在 `fe_sched_block_current()` 返回之后用它区分"**有人叫了我**"（回 `FE_OK`，由调用者重查条件，这是 futex 契约）与"只是被让出 / 伪唤醒"（回去重查）。把它删掉，这两件事在返回值上就不可分了 |
 
 ### 3.3 结论：K11 **不加第六处登记**，但要新增一把桶
 
@@ -521,7 +521,7 @@ K11 有**四条**假设依赖单核，逐条写清：
 | 端点 receiver 登记 | `kernel/ipc/ipc.c:457-459`；唤醒 `:150-157` |
 | 控制器锁：检查 + 登记在同一区间 | `kernel/resource.c:646-659`；摘除 `:405-424` |
 | 目标任务 `waiter` | `kernel/task/process.c:415-426`；摘除 `fe_task_clear_waiter`（`kernel/include/fe/task.h:168`） |
-| `wait_satisfied` 写两处、**无读者** | `kernel/ipc/ipc.c:580`、`:757` |
+| `wait_satisfied` 写两处、**写这份设计时无读者**（★ 5a 起有读者：`fe_wake_addr` 写、等待循环判"是有人叫我"还是"伪唤醒" ★） | `kernel/ipc/ipc.c:580`、`:757` |
 | `fe_sched_wake` 只接受 `BLOCKED`/`SLEEPING`，否则打诊断 | `kernel/sched/sched.c:925`、`:928`、`:955-962` |
 | `wake_sleepers` 只处理 `state == SLEEPING` | `kernel/sched/sched.c:832-846`（`:836`） |
 | `sleep_list_unlink`（`static`，返回 `bool`） | `kernel/sched/sched.c:862-878` |

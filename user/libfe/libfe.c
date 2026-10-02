@@ -323,6 +323,20 @@ long fe_fault_reply(u64 verdict, struct fe_fault_regs *regs)
     return fe_syscall(FE_SYS_FAULT_REPLY, (long)verdict, (long)regs, 0, 0, 0, 0);
 }
 
+/* ★ 等一个用户地址（K11）★ 语义与**唯一的正确用法**见 fe_user.h 上那段注释。
+ * 包装就是一层投影：这里不做任何"重试"或"翻译"——那会把
+ * "没睡过（-5 AGAIN）"与"被唤醒（0）"的区别糊掉，而调用者需要它。 */
+long fe_wait_addr(u32 *addr, u32 expected, u64 deadline_ns)
+{
+    return fe_syscall(FE_SYS_WAIT_ADDR, (long)addr, (long)expected,
+                      (long)deadline_ns, 0, 0, 0);
+}
+
+long fe_wake_addr(u32 *addr, u32 count)
+{
+    return fe_syscall(FE_SYS_WAKE_ADDR, (long)addr, (long)count, 0, 0, 0, 0);
+}
+
 long fe_wait(long task_handle, int *out_status)
 {
     return fe_syscall(FE_SYS_PROCESS_WAIT, task_handle, (long)out_status, 0, 0, 0, 0);

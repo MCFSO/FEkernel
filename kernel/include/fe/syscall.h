@@ -360,7 +360,22 @@ enum fe_syscall_num {
     FE_SYS_FAULT_HANDLER    = 0x92,  /* (ep_handle, regs_user_ptr) 登记 / 注销 */
     FE_SYS_FAULT_REPLY      = 0x93,  /* (verdict, regs_user_ptr) 处理者的决定 */
 
-    FE_SYS_MAX              = 0x94,
+    /* 0x94 / 0x95 —— 等一个用户地址（K11），语义见下面的共享 ABI 注释。
+     *
+     * ★ 号先查再用（`FE_SYS_MAX` 是 0x94，所以这两个正好接上）★
+     * 与 K5 同一条纪律：不猜、也不"看情况顺延"。 */
+    FE_SYS_WAIT_ADDR        = 0x94,  /* (uaddr, expected_u32, deadline_ns) */
+    FE_SYS_WAKE_ADDR        = 0x95,  /* (uaddr, count) */
+
+    /* ★★ `FE_SYS_MAX` 是**上界（排他）**：最大已用号 = MAX - 1，
+     * 下一个空号 = MAX。取号前请看**分发表里的 `case` 列表**
+     * （`kernel/arch/x86_64/syscall.c` 的 `fe_syscall_dispatch`），
+     * 那是权威判据——MAX 只是一个派生值，它可能落后于实际用掉的号。
+     * ★ 这条是实测校准过的 ★ `docs/22`（K12）与 `docs/23`（K13）都把它
+     * 当成了闭区间：K12 以为 K11 只能取 0x95/0x96，K13 把 0x94 许给了
+     * `FE_SYS_EXEC_ENV`（**与 K11 冲突**）。K13 落地时 `EXEC_ENV` 必须
+     * 从 **0x96** 起。★★ */
+    FE_SYS_MAX              = 0x96,
 };
 
 /* ---- 用户态异常处理者（K5）的共享 ABI ----
@@ -395,6 +410,28 @@ enum fe_syscall_num {
 #define FE_FAULT_KILL          2u    /* 我不管：照旧杀线程（今天的行为） */
 #define FE_FAULT_RETHROW       3u    /* 再抛一次：让本线程再走一轮投递 */
 #define FE_FAULT_FLAG_KEEP_REGS 0x10u /* 与 RESUME 同用：现场用原来的，不改 */
+
+/* ---- 等一个用户地址（K11）的共享 ABI ----
+ * 设计与逐条语义见 docs/21-user-address-wait.md。
+ *
+ *   FE_SYS_WAIT_ADDR(uaddr, expected, deadline_ns)
+ *       等**本地址空间**里 `uaddr` 处的 u32 不再等于 `expected`（低 32 位）。
+ *       `uaddr` 必须 4 字节对齐；`deadline_ns` 是**绝对**单调纳秒
+ *       （K7 的 fe_clock_ns 那条时钟），**0 = 无限等**。
+ *       返回：0 被唤醒（**必须重查**，内核不保证为什么醒）；
+ *             -5 值不等于期望（**没睡过**，这是 futex 的 EAGAIN）；
+ *             -12 到点；-7 地址读不了；-21 被取消；-1 参数非法。
+ *
+ *   FE_SYS_WAKE_ADDR(uaddr, count)
+ *       唤醒本地址空间里等在 `uaddr` 上的至多 count 个线程，0 = 全部。
+ *       返回实际唤醒的个数（唤醒一个没人等的地址返回 0，**不是错**）。
+ *
+ * ★ 键是 `(地址空间, 地址)` ★ 微内核里同一个虚拟地址在不同任务里是两个
+ * 变量，所以唤醒**只**作用于自己地址空间里的等待者。
+ *
+ * ★ 这两个调用里**没有**任何"futex"字样 ★ 内核不认识 POSIX 名字，也不认识
+ * `FUTEX_*` 那套操作码（PI / requeue / robust list 一律不做）；号与形状
+ * 都是我们自己的（docs/20 §1.2.5）。 */
 
 /* ---- 两条系统调用的逐条语义 ----
  *

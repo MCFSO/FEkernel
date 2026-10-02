@@ -1529,6 +1529,40 @@ static i64 sys_fault_reply(u64 verdict, u64 user_regs)
 }
 
 /* ------------------------------------------------------------------ */
+/* 等一个用户地址（K11）                                                */
+/* ------------------------------------------------------------------ */
+
+/* ★ 这一层只做两件事：参数校验（对齐 / 空指针）与转发 ★
+ * 语义全在 kernel/ipc/ipc.c 的 fe_wait_addr / fe_wake_addr 里
+ * （与 sys_task_terminate 同一层）。 */
+static i64 sys_wait_addr(u64 uaddr, u64 expected, u64 deadline_ns)
+{
+    struct fe_task *t = fe_task_current();
+    if (!t || !uaddr) {
+        return FE_ERR_INVAL;
+    }
+    /* 对齐在机制层也判；这里先判一次是为了让"参数写错了"与"地址读不了"
+     * 在返回值上分得开——前者 INVAL，后者 FAULT。 */
+    if ((uaddr & 3ull) != 0) {
+        return FE_ERR_INVAL;
+    }
+    return fe_wait_addr(t, uaddr, expected, deadline_ns);
+}
+
+static i64 sys_wake_addr(u64 uaddr, u64 count)
+{
+    struct fe_task *t = fe_task_current();
+    if (!t || !uaddr || (uaddr & 3ull) != 0) {
+        return FE_ERR_INVAL;
+    }
+    /* ★ count 是 u64，机制层要 u32 ★ 不截断而是**饱和**：
+     * 截断会把"唤醒 0x100000001 个"变成"唤醒 1 个"——静默改了语义。
+     * 饱和到一个远大于任何可能等待者数的值，效果等于"全部"。 */
+    u32 n = (count > 0x100000ull) ? 0x100000u : (u32)count;
+    return (i64)fe_wake_addr(t->space, uaddr, n);
+}
+
+/* ------------------------------------------------------------------ */
 /* 分发                                                                */
 /* ------------------------------------------------------------------ */
 
@@ -1703,6 +1737,12 @@ void fe_syscall_dispatch(struct fe_regs *r)
         break;
     case FE_SYS_FAULT_REPLY:
         ret = sys_fault_reply(a1, a2);
+        break;
+    case FE_SYS_WAIT_ADDR:
+        ret = sys_wait_addr(a1, a2, a3);
+        break;
+    case FE_SYS_WAKE_ADDR:
+        ret = sys_wake_addr(a1, a2);
         break;
     default:
         fe_kprintf("[syscall] 未知调用号 %llu (线程 %s)\n",

@@ -830,6 +830,31 @@ static struct unit g_units[] = {
     { .name = "faulttest-rec", .path = "/bin/faulttest", .expect = 0x77, .check = 1,
       .args = { "--recursive", NULL } },
 
+    /* 等一个用户地址（K11）的**真实路径**验证：用户态线程 → FE_SYS_WAIT_ADDR
+     * → 内核读用户内存 + 挂链 + 置 BLOCKED → 另一个线程改内存 + FE_SYS_WAKE_ADDR
+     * → 被调度回来。
+     *
+     * ★ 为什么是**四个**单元 ★ 与 exectest/faulttest 同一条理由：一个进程只有
+     * 一个退出码，而这四种模式的成功判据各不相同——
+     *   --cond    条件变量：3 生产者 + 1 消费者，总数**精确相等**（退出码 0）
+     *   --spin    **反向**：同一条逻辑用纯自旋，同样预算内跑不完（0x5B）
+     *   --timeout 超时：只断言"**不早于** deadline 返回"（0）
+     *   --drop    **反向**：故意丢一次唤醒 → 总数必须对不上（0x4D）
+     * ★ `--spin` 与 `--drop` 的"成功"是**确定的非零码**，不是 0 ★
+     * 它们测的是"没有这条机制会怎样"，所以成功恰恰意味着"确实没做成"。
+     *
+     * ★ 四个单元都**没有 needs** ★ 不用块设备、不用中断线、不用文件系统
+     * （共享状态就是 .bss 里的几个 u32），所以 QEMU 与 VirtualBox 两个环境
+     * 都必须真的跑。按 needs 跳过它等于把"等待原语的用户态路径只有编译级
+     * 保证"这个空白又留回去（docs/21 §7.3）。 */
+    { .name = "waitaddrtest", .path = "/bin/waitaddrtest", .expect = 0, .check = 1 },
+    { .name = "waitaddrtest-spin", .path = "/bin/waitaddrtest", .expect = 0,
+      .check = 1, .args = { "--spin", NULL } },
+    { .name = "waitaddrtest-to", .path = "/bin/waitaddrtest", .expect = 0, .check = 1,
+      .args = { "--timeout", NULL } },
+    { .name = "waitaddrtest-drop", .path = "/bin/waitaddrtest", .expect = 0x4D,
+      .check = 1, .args = { "--drop", NULL } },
+
     /* --- 常驻服务 --- */
     { .name = "blkd",  .path = "/sbin/blkd",  .provides = "/dev/blk0", .daemon = 1,
       /* 参数在启动前由 busmaster_probe 回填（端口是**运行时发现**出来的）：
